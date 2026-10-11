@@ -71,3 +71,5 @@ Get-Clipboard | .\codex.exe proxy configure --stdin
 Codex 源码沿用 [Apache-2.0](LICENSE)。随发行包提供的 Mihomo、ProxyBridge 和 WinDivert 保留各自的许可证与来源说明。
 
 这个项目与 OpenAI、MetaCubeX 没有隶属或官方合作关系。
+
+本 README 由 OpenAI Codex 编写。
