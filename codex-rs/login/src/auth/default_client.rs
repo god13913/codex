@@ -223,7 +223,9 @@ pub fn create_client_with_chatgpt_cookies(http_client_factory: &HttpClientFactor
     let builder = default_http_client_builder()
         .with_chatgpt_cookies(http_client_factory)
         .without_request_logging();
-    if !http_client_factory.network_policy().is_managed() {
+    if !http_client_factory.network_policy().is_managed()
+        && !http_client_factory.has_dedicated_proxy()
+    {
         return build_default_client(builder);
     }
     let mut pool = RouteAwareClientPool::with_builder(
@@ -231,6 +233,9 @@ pub fn create_client_with_chatgpt_cookies(http_client_factory: &HttpClientFactor
         ClientRouteClass::Api,
         builder,
     );
+    if http_client_factory.has_dedicated_proxy() {
+        return pool.into_client();
+    }
     if is_sandboxed() {
         pool = pool.with_legacy_direct_proxy_and_custom_ca_fallback();
     } else if matches!(
@@ -274,6 +279,14 @@ fn create_client_for_route_with_builder(
     route_class: ClientRouteClass,
     builder: HttpClientBuilder,
 ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
+    if http_client_factory.has_dedicated_proxy() {
+        return Ok(RouteAwareClientPool::with_builder(
+            http_client_factory.clone(),
+            route_class,
+            builder,
+        )
+        .into_client());
+    }
     if http_client_factory.network_policy().is_managed() {
         let mut pool = codex_http_client::RouteAwareClientPool::with_builder(
             http_client_factory.clone(),
@@ -391,6 +404,15 @@ pub async fn create_transport_for_routes_async(
             http_client_factory.outbound_proxy_policy(),
             OutboundProxyPolicy::ReqwestDefault
         );
+        if http_client_factory.has_dedicated_proxy() {
+            return ReqwestTransport::from_route_aware_client_pool(
+                RouteAwareClientPool::with_builder(
+                    http_client_factory,
+                    route_class,
+                    default_http_client_builder(),
+                ),
+            );
+        }
         if !http_client_factory.network_policy().is_managed()
             && (transport_default_proxy || sandboxed)
         {

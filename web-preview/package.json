@@ -1,0 +1,19 @@
+{
+  "name": "codex-proxy-web-preview",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "node scripts/build.mjs"
+  },
+  "dependencies": {
+    "@fontsource/material-symbols-rounded": "^5.3.9",
+    "@material/material-color-utilities": "^0.4.0",
+    "@material/web": "^2.5.0",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "vite": "^8.3.4"
+  }
+}

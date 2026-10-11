@@ -1,3 +1,15 @@
+# Codex Windows 专属代理定制版
+
+这是基于 [OpenAI 官方 Codex](https://github.com/openai/codex) 的非官方 Fork。此分支为 Windows 的 Codex CLI 增加服务请求专属代理、单节点订阅管理，以及与原安装 ChatGPT 桌面配合的定向 TCP 转发。官方桌面安装文件不包含在本仓库中。
+
+- [定制功能、配置与验证范围](docs/dedicated-proxy.md)
+- [安装器与界面源码](web-preview/README.md)
+- [Windows 构建与发布说明](docs/windows-release.md)
+- [构建物与安装包](https://github.com/god13913/codex/releases)
+
+Codex 源码沿用 Apache-2.0；Mihomo、ProxyBridge、WinDivert 等组件保留各自的许可证及来源说明。当前交付已完成编译、清单哈希和安装包隐私审计；账户、模型请求与桌面转发未做运行验证。下方为官方项目原有说明。
+
+---
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
   <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />

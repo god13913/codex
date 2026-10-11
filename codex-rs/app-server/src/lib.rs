@@ -529,6 +529,18 @@ pub async fn run_main_with_transport_options(
         )
     })?;
     let codex_home = find_codex_home()?;
+    // Keep the private core alive before auth/cloud bootstrap and through server shutdown.
+    // A transient subscription/core connection failure must not terminate the app-server;
+    // the dedicated proxy records the failure and subsequent requests can report their own
+    // network error while the user repairs or refreshes the proxy configuration.
+    let _dedicated_proxy_runtime = match codex_dedicated_proxy::start_if_enabled(&codex_home).await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            warn!(error = %error, "dedicated proxy unavailable; continuing without private proxy");
+            None
+        }
+    };
     let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         arg0_paths.codex_self_exe.clone(),
         arg0_paths.codex_linux_sandbox_exe.clone(),

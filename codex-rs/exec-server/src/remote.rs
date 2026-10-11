@@ -112,7 +112,7 @@ impl EnvironmentRegistryClient {
             base_url,
             auth_provider,
             http: RouteAwareClientPool::new_without_redirects_or_request_logging(
-                http_client_factory,
+                http_client_factory.without_dedicated_proxy(),
                 ClientRouteClass::Api,
             ),
             connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,

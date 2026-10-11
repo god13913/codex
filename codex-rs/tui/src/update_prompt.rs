@@ -52,6 +52,9 @@ pub(crate) async fn run_update_prompt_if_needed(
     tui: &mut Tui,
     config: &Config,
 ) -> Result<UpdatePromptOutcome> {
+    if codex_dedicated_proxy::custom_distribution() {
+        return Ok(UpdatePromptOutcome::Continue);
+    }
     let Some(latest_version) = updates::get_upgrade_version_for_popup(config) else {
         return Ok(UpdatePromptOutcome::Continue);
     };

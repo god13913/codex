@@ -15,6 +15,9 @@ use crate::client::TransportClient;
 const MAX_CACHED_RUSTLS_DESTINATIONS: usize = 16;
 // Schannel maps TLS alert 70 (protocol_version) to SEC_E_UNSUPPORTED_FUNCTION.
 const SCHANNEL_PROTOCOL_VERSION_ERROR: i32 = 0x8009_0302_u32 as i32;
+// Windows also reports a rejected handshake alert as SEC_E_ILLEGAL_MESSAGE.
+// Match the status code, since FormatMessage output is localized.
+const SCHANNEL_ILLEGAL_MESSAGE_ERROR: i32 = 0x8009_0326_u32 as i32;
 
 #[derive(Clone, Default)]
 pub(crate) struct RustlsClientCache {
@@ -133,12 +136,16 @@ fn has_retryable_tls_error(error: &(dyn Error + 'static)) -> bool {
         // Linux OpenSSL reports the peer's "tlsv1 alert protocol version".
         let is_linux_protocol_version_error = message.contains("tlsv1 alert protocol version");
         // Windows Schannel may expose the protocol alert as a raw or formatted OS error.
-        let is_schannel_protocol_version_error = error
+        let schannel_status = error
             .downcast_ref::<std::io::Error>()
-            .and_then(std::io::Error::raw_os_error)
-            == Some(SCHANNEL_PROTOCOL_VERSION_ERROR)
-            || message.contains("(os error -2146893054)")
-            || message.contains("0x80090302");
+            .and_then(std::io::Error::raw_os_error);
+        let is_schannel_protocol_version_error = matches!(
+            schannel_status,
+            Some(SCHANNEL_PROTOCOL_VERSION_ERROR | SCHANNEL_ILLEGAL_MESSAGE_ERROR)
+        ) || message.contains("(os error -2146893054)")
+            || message.contains("0x80090302")
+            || message.contains("(os error -2146893018)")
+            || message.contains("0x80090326");
         if is_macos_protocol_version_error
             || is_linux_protocol_version_error
             || is_schannel_protocol_version_error

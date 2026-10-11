@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "dedicated-proxy",
     "aws-auth",
     "analytics",
     "agent-graph-store",
@@ -217,6 +218,7 @@ codex-core-api = { path = "core-api" }
 codex-core-plugin-common = { path = "core-plugin-common" }
 codex-core-plugins = { path = "core-plugins" }
 codex-diagnostics = { path = "diagnostics" }
+codex-dedicated-proxy = { path = "dedicated-proxy" }
 codex-exec = { path = "exec" }
 codex-file-system = { path = "file-system" }
 codex-exec-server-protocol = { path = "exec-server-protocol" }

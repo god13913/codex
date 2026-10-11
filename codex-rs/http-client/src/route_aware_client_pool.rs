@@ -335,13 +335,17 @@ impl RouteAwareClientPool {
     /// Use this only when migrating a client that already continued with system roots after a
     /// custom-CA construction failure. System-proxy routes still propagate construction errors.
     pub fn with_legacy_custom_ca_fallback(mut self) -> Self {
-        self.custom_ca_fallback = CustomCaFallback::LegacyTransportDefault;
+        if !self.http_client_factory.has_dedicated_proxy() {
+            self.custom_ca_fallback = CustomCaFallback::LegacyTransportDefault;
+        }
         self
     }
 
     /// Preserves the legacy sandbox client's direct routing and custom-CA fallback.
     pub fn with_legacy_direct_proxy_and_custom_ca_fallback(mut self) -> Self {
-        self.custom_ca_fallback = CustomCaFallback::LegacyDirect;
+        if !self.http_client_factory.has_dedicated_proxy() {
+            self.custom_ca_fallback = CustomCaFallback::LegacyDirect;
+        }
         self
     }
 
@@ -550,6 +554,7 @@ impl RouteAwareClientPool {
             && (self.http_client_factory.outbound_proxy_policy()
                 == OutboundProxyPolicy::RespectSystemProxy
                 || self.http_client_factory.network_policy().is_managed()
+                || self.http_client_factory.has_dedicated_proxy()
                 || self.rustls_clients.is_some())
     }
 

@@ -166,6 +166,7 @@ impl fmt::Debug for OutboundProxyRoute {
 #[derive(Clone)]
 pub struct HttpClientFactory {
     outbound_proxy_policy: OutboundProxyPolicy,
+    dedicated_proxy: Option<String>,
     system_proxy_fallback: bool,
     chatgpt_cookie_store: Option<Arc<ChatGptCookieStore>>,
     network_policy: NetworkPolicy,
@@ -174,6 +175,7 @@ pub struct HttpClientFactory {
 impl PartialEq for HttpClientFactory {
     fn eq(&self, other: &Self) -> bool {
         self.outbound_proxy_policy == other.outbound_proxy_policy
+            && self.dedicated_proxy == other.dedicated_proxy
             && self.system_proxy_fallback == other.system_proxy_fallback
             && self.network_policy == other.network_policy
             && self
@@ -193,6 +195,10 @@ impl fmt::Debug for HttpClientFactory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpClientFactory")
             .field("outbound_proxy_policy", &self.outbound_proxy_policy)
+            .field(
+                "dedicated_proxy",
+                &self.dedicated_proxy.as_ref().map(|_| "<redacted>"),
+            )
             .field("system_proxy_fallback", &self.system_proxy_fallback)
             .field("network_policy", &self.network_policy)
             .finish()
@@ -204,10 +210,53 @@ impl HttpClientFactory {
     pub const fn new(outbound_proxy_policy: OutboundProxyPolicy) -> Self {
         Self {
             outbound_proxy_policy,
+            dedicated_proxy: None,
             system_proxy_fallback: false,
             chatgpt_cookie_store: None,
             network_policy: NetworkPolicy::unmanaged(),
         }
+    }
+
+    /// Pins service-owned traffic to a private local proxy. Tools must remove this override.
+    /// The URL is never included in diagnostics and must contain runtime-only credentials.
+    pub fn with_dedicated_proxy(mut self, url: String) -> Self {
+        self.dedicated_proxy = Some(url);
+        self
+    }
+
+    /// Preserves the original environment/system routing for delegated tool traffic.
+    pub fn without_dedicated_proxy(mut self) -> Self {
+        self.dedicated_proxy = None;
+        self
+    }
+
+    pub fn has_dedicated_proxy(&self) -> bool {
+        self.dedicated_proxy.is_some()
+    }
+
+    fn dedicated_route(&self, request_url: &str) -> Option<OutboundProxyRoute> {
+        let proxy = self.dedicated_proxy.as_ref()?;
+        let loopback = request_url
+            .parse::<http::Uri>()
+            .ok()
+            .and_then(|uri| {
+                uri.host().map(|host| {
+                    host.eq_ignore_ascii_case("localhost")
+                        || host
+                            .trim_matches(['[', ']'])
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback())
+                })
+            })
+            .unwrap_or(false);
+        Some(if loopback {
+            OutboundProxyRoute::Direct
+        } else {
+            OutboundProxyRoute::Proxy {
+                url: proxy.clone(),
+                no_proxy: None,
+            }
+        })
     }
 
     /// Carries the account/configuration owner's application policy into every transport.
@@ -235,6 +284,7 @@ impl HttpClientFactory {
 
     pub fn allows_system_proxy_fallback(&self) -> bool {
         self.system_proxy_fallback
+            && self.dedicated_proxy.is_none()
             && self.outbound_proxy_policy == OutboundProxyPolicy::ReqwestDefault
     }
 
@@ -267,6 +317,9 @@ impl HttpClientFactory {
     /// resolution is unavailable, explicit environment settings are resolved before falling back
     /// to a direct route.
     pub fn resolve_proxy_route(&self, request_url: &str) -> OutboundProxyRoute {
+        if let Some(route) = self.dedicated_route(request_url) {
+            return route;
+        }
         resolve_proxy_route(
             &ProcessEnv,
             request_url,
@@ -280,6 +333,9 @@ impl HttpClientFactory {
         &self,
         request_url: String,
     ) -> io::Result<OutboundProxyRoute> {
+        if let Some(route) = self.dedicated_route(&request_url) {
+            return Ok(route);
+        }
         if matches!(
             self.outbound_proxy_policy,
             OutboundProxyPolicy::ReqwestDefault
@@ -329,6 +385,10 @@ impl HttpClientFactory {
         request_url: &str,
         route_class: ClientRouteClass,
     ) -> Result<reqwest::Client, BuildRouteAwareHttpClientError> {
+        if let Some(route) = self.dedicated_route(request_url) {
+            let builder = configure_builder_for_resolved_route(builder, route_class, &route)?;
+            return build_reqwest_client_with_custom_ca(builder).map_err(Into::into);
+        }
         build_reqwest_client_for_route(
             builder,
             request_url,
@@ -524,7 +584,7 @@ fn configure_concrete_proxy(
             return Err(BuildRouteAwareHttpClientError::InvalidProxyConfig { route_class });
         }
     };
-    Ok(builder.proxy(proxy.no_proxy(no_proxy)))
+    Ok(builder.no_proxy().proxy(proxy.no_proxy(no_proxy)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -22,6 +22,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+codex-dedicated-proxy = { workspace = true }
 codex-build-info = { workspace = true }
 anyhow = { workspace = true }
 axum = { workspace = true, default-features = false, features = ["http1", "tokio"] }

@@ -4,6 +4,7 @@ use pretty_assertions::assert_eq;
 
 use super::MAX_CACHED_RUSTLS_DESTINATIONS;
 use super::RustlsClientCache;
+use super::SCHANNEL_ILLEGAL_MESSAGE_ERROR;
 use super::SCHANNEL_PROTOCOL_VERSION_ERROR;
 use super::has_retryable_tls_error;
 use crate::HttpClientBuilder;
@@ -76,6 +77,16 @@ fn recognizes_schannel_protocol_version_error_codes() {
         ),
         (true, false)
     );
+}
+
+#[test]
+fn localized_schannel_handshake_failure_is_recognized_by_status_only() {
+    let handshake = io::Error::from_raw_os_error(SCHANNEL_ILLEGAL_MESSAGE_ERROR);
+    let untrusted_root = io::Error::from_raw_os_error(0x8009_0325_u32 as i32);
+    let unknown_certificate = io::Error::from_raw_os_error(0x8009_0327_u32 as i32);
+    assert!(has_retryable_tls_error(&handshake));
+    assert!(!has_retryable_tls_error(&untrusted_root));
+    assert!(!has_retryable_tls_error(&unknown_certificate));
 }
 
 #[test]

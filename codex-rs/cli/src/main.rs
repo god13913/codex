@@ -72,6 +72,7 @@ mod mcp_cmd;
 mod mcp_login;
 mod migrate_rollouts;
 mod plugin_cmd;
+mod proxy_cmd;
 mod queue_cmd;
 mod remote_control_cmd;
 #[cfg(target_os = "windows")]
@@ -145,6 +146,8 @@ struct MultitoolCli {
 
 #[derive(Debug, clap::Subcommand)]
 enum Subcommand {
+    /// Manage the private subscription used only by Codex service requests.
+    Proxy(proxy_cmd::ProxyCommand),
     /// Browse all agent sessions on the shared local app-server daemon.
     Agents(AgentsCommand),
 
@@ -791,6 +794,9 @@ fn run_update_action(
     action: UpdateAction,
     cli_executable: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
+    if codex_dedicated_proxy::custom_distribution() {
+        anyhow::bail!("official updates are disabled for the dedicated-proxy distribution");
+    }
     if let UpdateAction::Daemon(source) = action {
         let executable = cli_executable
             .ok_or_else(|| anyhow::anyhow!("Cannot locate the launching Codex CLI"))?;
@@ -1093,7 +1099,52 @@ async fn cli_main(
     }
 
     let open_agents_overview = matches!(&subcommand, Some(Subcommand::Agents(_)));
+    if codex_dedicated_proxy::custom_distribution()
+        && matches!(
+            &subcommand,
+            Some(Subcommand::AppServer(server))
+                if matches!(&server.subcommand, Some(AppServerSubcommand::Daemon(command))
+                    if matches!(&command.subcommand,
+                        AppServerDaemonSubcommand::Update { .. }
+                        | AppServerDaemonSubcommand::PidUpdateLoop { check_package_ownership: false, .. }))
+        )
+    {
+        anyhow::bail!(
+            "daemon package updates are disabled for the dedicated-proxy distribution; replace the complete custom package"
+        );
+    }
+    let needs_dedicated_proxy = matches!(
+        &subcommand,
+        None | Some(Subcommand::Agents(_))
+            | Some(Subcommand::Exec(_))
+            | Some(Subcommand::Review(_))
+            | Some(Subcommand::Login(_))
+            | Some(Subcommand::Logout(_))
+            | Some(Subcommand::Resume(_))
+            | Some(Subcommand::Fork(_))
+    ) || matches!(&subcommand, Some(Subcommand::AppServer(server)) if server.subcommand.is_none());
+    let _proxy_runtime = if needs_dedicated_proxy {
+        match codex_dedicated_proxy::start_if_enabled(&find_codex_home()?).await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return Err(error.context(
+                    "dedicated proxy could not start; service requests were not sent directly",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    if _proxy_runtime.is_some() {
+        if root_remote.is_some() {
+            anyhow::bail!(
+                "dedicated proxy must be configured on the actual remote app-server; local service proxy cannot route remote model requests"
+            );
+        }
+        interactive.no_daemon = true;
+    }
     match subcommand {
+        Some(Subcommand::Proxy(command)) => proxy_cmd::run(command).await?,
         None | Some(Subcommand::Agents(_)) => {
             prepend_config_flags(
                 &mut interactive.config_overrides,
@@ -1634,6 +1685,11 @@ async fn cli_main(
             print_completion(completion_cli);
         }
         Some(Subcommand::Update) => {
+            if codex_dedicated_proxy::custom_distribution() {
+                anyhow::bail!(
+                    "this is a dedicated-proxy distribution; rebuild or replace the complete custom package instead of installing an official binary"
+                );
+            }
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
                 root_remote_auth_token_env.as_deref(),
@@ -2254,6 +2310,7 @@ fn unsupported_subcommand_name_for_strict_config(
     subcommand: &Option<Subcommand>,
 ) -> Option<&'static str> {
     match subcommand {
+        Some(Subcommand::Proxy(_)) => Some("proxy"),
         None
         | Some(Subcommand::Agents(_))
         | Some(Subcommand::Exec(_))

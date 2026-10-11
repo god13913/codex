@@ -1720,6 +1720,9 @@ impl Config {
         };
         let mut factory = HttpClientFactory::new(outbound_proxy_policy)
             .with_network_policy(self.application_network_policy.clone());
+        if let Some(endpoint) = codex_dedicated_proxy::active_proxy_url() {
+            factory = factory.with_dedicated_proxy(endpoint);
+        }
         if !self.respect_system_proxy && self.features.enabled(Feature::SystemProxyFallback) {
             factory = factory.with_system_proxy_fallback();
         }
@@ -3092,6 +3095,9 @@ pub fn resolve_bootstrap_http_client_factory(
         OutboundProxyPolicy::ReqwestDefault
     };
     let mut factory = HttpClientFactory::new(outbound_proxy_policy);
+    if let Some(endpoint) = codex_dedicated_proxy::active_proxy_url() {
+        factory = factory.with_dedicated_proxy(endpoint);
+    }
     if outbound_proxy_policy == OutboundProxyPolicy::ReqwestDefault
         && features.enabled(Feature::SystemProxyFallback)
     {

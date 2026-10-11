@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <RuntimeFrameworkVersion>8.0.25</RuntimeFrameworkVersion>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>CodexProxySetup</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\codex-proxy-app-icon.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <Company>Codex Proxy Setup</Company>
+    <Product>Codex 代理配置</Product>
+    <Description>配置用户自己的订阅或节点</Description>
+    <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildProjectDirectory)=/src/configurator</PathMap>
+    <MSBuildEnableWorkloadResolver>false</MSBuildEnableWorkloadResolver>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2903.40" />
+    <PackageReference Include="YamlDotNet" Version="16.3.0" />
+    <EmbeddedResource Include="..\web-preview\dist\index.html" LogicalName="configurator-ui.html" />
+    <EmbeddedResource Include="Assets/runtime.zip" LogicalName="runtime.zip" Condition="Exists('Assets/runtime.zip')" />
+    <EmbeddedResource Include="Assets/runtime-manifest.json" LogicalName="runtime-manifest.json" Condition="Exists('Assets/runtime-manifest.json')" />
+    <EmbeddedResource Include="Assets/notices.zip" LogicalName="notices.zip" Condition="Exists('Assets/notices.zip')" />
+  </ItemGroup>
+  <Target Name="RemoveUnusedWebView2Wpf" BeforeTargets="ResolveAssemblyReferences">
+    <ItemGroup>
+      <_UnusedWebView2Wpf Include="@(Reference)" Condition="'%(Reference.Filename)' == 'Microsoft.Web.WebView2.Wpf'" />
+      <Reference Remove="@(_UnusedWebView2Wpf)" />
+    </ItemGroup>
+  </Target>
+</Project>

@@ -103,26 +103,41 @@ pub(super) enum WorkspaceRoutingError {
     InvalidBackendOrigin,
 }
 
+fn should_degrade_routing(error: &WorkspaceRoutingError) -> bool {
+    codex_dedicated_proxy::custom_distribution()
+        && matches!(
+            error,
+            WorkspaceRoutingError::DiscoveryFailed
+                | WorkspaceRoutingError::DiscoveryTimeout
+                | WorkspaceRoutingError::DiscoveryUnauthorized
+        )
+}
+
 impl WorkspaceRoutingResolver for AccountRequestProcessor {
     fn resolve(
         &self,
         request: WorkspaceRoutingRequest,
     ) -> Pin<Box<dyn Future<Output = io::Result<Option<WorkspaceRouting>>> + Send + '_>> {
         Box::pin(async move {
-            self.read_account(Some(&request))
-                .await
-                .map(|account| account.workspace_routing)
-                .map_err(|error| match error {
-                    AccountReadError::InvalidAccount(error) => io::Error::other(error),
-                    AccountReadError::Routing(error) => io::Error::new(
-                        if error == WorkspaceRoutingError::DiscoveryUnauthorized {
-                            io::ErrorKind::PermissionDenied
-                        } else {
-                            io::ErrorKind::Other
-                        },
-                        error,
-                    ),
-                })
+            match self.read_account(Some(&request)).await {
+                Ok(account) => Ok(account.workspace_routing),
+                Err(AccountReadError::Routing(error)) if should_degrade_routing(&error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "workspace routing unavailable; continuing with configured provider origin"
+                    );
+                    Ok(None)
+                }
+                Err(AccountReadError::InvalidAccount(error)) => Err(io::Error::other(error)),
+                Err(AccountReadError::Routing(error)) => Err(io::Error::new(
+                    if error == WorkspaceRoutingError::DiscoveryUnauthorized {
+                        io::ErrorKind::PermissionDenied
+                    } else {
+                        io::ErrorKind::Other
+                    },
+                    error,
+                )),
+            }
         })
     }
 }
@@ -159,13 +174,32 @@ impl AccountRequestProcessor {
         params: GetAccountParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         self.refresh_token_if_requested(params.refresh_token).await;
-        let read = self
-            .read_account(/*request*/ None)
-            .await
-            .map_err(|error| match error {
-                AccountReadError::InvalidAccount(error) => invalid_request(error.to_string()),
-                AccountReadError::Routing(error) => internal_error(error.to_string()),
-            })?;
+        let read = match self.read_account(/*request*/ None).await {
+            Ok(read) => read,
+            Err(AccountReadError::Routing(error)) if should_degrade_routing(&error) => {
+                tracing::warn!(
+                    error = %error,
+                    "account/read routing discovery unavailable; returning account without workspace routing"
+                );
+                AccountRead {
+                    account_state: self.account_state_without_routing().await.map_err(|error| {
+                        match error {
+                            AccountReadError::InvalidAccount(error) => {
+                                invalid_request(error.to_string())
+                            }
+                            AccountReadError::Routing(error) => internal_error(error.to_string()),
+                        }
+                    })?,
+                    workspace_routing: None,
+                }
+            }
+            Err(AccountReadError::InvalidAccount(error)) => {
+                return Err(invalid_request(error.to_string()));
+            }
+            Err(AccountReadError::Routing(error)) => {
+                return Err(internal_error(error.to_string()));
+            }
+        };
         Ok(Some(
             GetAccountResponse {
                 account: read.account_state.account.map(Account::from),
@@ -185,6 +219,18 @@ impl AccountRequestProcessor {
             }
             .into(),
         ))
+    }
+
+    async fn account_state_without_routing(
+        &self,
+    ) -> Result<ProviderAccountState, AccountReadError> {
+        let config = self.load_latest_config().await;
+        create_model_provider(
+            config.model_provider,
+            Some(self.auth_manager.clone()),
+        )
+        .account_state()
+        .map_err(AccountReadError::InvalidAccount)
     }
 
     pub(super) async fn read_account(

@@ -841,8 +841,10 @@ pub fn apply_http_headers_helper(
 impl McpRuntimeContext {
     pub fn new(environment_manager: Arc<EnvironmentManager>, local_process_cwd: PathBuf) -> Self {
         let local_http_client = Arc::new(
-            RouteAwareHttpClient::new(environment_manager.http_client_factory().clone())
-                .with_tls_backend_fallback(),
+            RouteAwareHttpClient::new_for_service(
+                environment_manager.http_client_factory().clone(),
+            )
+            .with_tls_backend_fallback(),
         );
         Self {
             environment_manager,

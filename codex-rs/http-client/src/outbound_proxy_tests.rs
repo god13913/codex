@@ -1,6 +1,55 @@
 //! Shared outbound proxy policy tests.
 
 use super::*;
+
+#[tokio::test]
+async fn dedicated_service_route_precedes_system_and_environment_and_excludes_loopback() {
+    let endpoint = "http://codex:PRIVATE_RUNTIME_PASSWORD@127.0.0.1:17899".to_owned();
+    for policy in [
+        OutboundProxyPolicy::ReqwestDefault,
+        OutboundProxyPolicy::RespectSystemProxy,
+    ] {
+        let factory = HttpClientFactory::new(policy)
+            .with_system_proxy_fallback()
+            .with_dedicated_proxy(endpoint.clone());
+        assert!(!factory.allows_system_proxy_fallback());
+        for destination in [
+            "https://api.openai.com/v1/responses",
+            "wss://chatgpt.com/backend-api",
+            "https://localhost.evil.example/",
+        ] {
+            let expected = OutboundProxyRoute::Proxy {
+                url: endpoint.clone(),
+                no_proxy: None,
+            };
+            assert_eq!(factory.resolve_proxy_route(destination), expected);
+            assert_eq!(
+                factory
+                    .resolve_proxy_route_async(destination.to_owned())
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        for destination in [
+            "http://127.0.0.1:1455/callback",
+            "ws://localhost:8000/",
+            "http://[::1]:1455/",
+        ] {
+            assert_eq!(
+                factory.resolve_proxy_route(destination),
+                OutboundProxyRoute::Direct
+            );
+        }
+        let debug = format!("{factory:?}");
+        assert!(!debug.contains("PRIVATE_RUNTIME_PASSWORD"));
+        let tool = factory.without_dedicated_proxy();
+        assert!(!tool.has_dedicated_proxy());
+        assert!(
+            tool.allows_system_proxy_fallback() == (policy == OutboundProxyPolicy::ReqwestDefault)
+        );
+    }
+}
 use crate::HttpClientBuilder;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -22,10 +71,62 @@ struct MapEnv {
     values: HashMap<String, String>,
 }
 
+#[tokio::test]
+async fn dedicated_http_request_uses_authenticated_proxy_and_failure_does_not_bypass() {
+    let (address, server) = spawn_proxy_listener();
+    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+        .with_dedicated_proxy(format!("http://codex:test-password@{address}"));
+    let client = factory
+        .build_client("http://example.invalid/", ClientRouteClass::Api)
+        .unwrap();
+    let response = client.get("http://example.invalid/").send().await.unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let requests = server.join().unwrap();
+    assert!(
+        requests[0]
+            .to_ascii_lowercase()
+            .contains("proxy-authorization: basic ")
+    );
+    // The proxy has exited. The origin is unreachable, and must never be tried directly.
+    assert!(client.get("http://example.invalid/").send().await.is_err());
+}
+
 fn spawn_proxy_listener() -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<String>>) {
     spawn_http_listener(vec![
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string(),
     ])
+}
+
+#[tokio::test]
+async fn dedicated_sse_body_uses_the_same_authenticated_route() {
+    use futures::StreamExt;
+    let frame = "data: {\"delta\":\"ok\"}\n\n";
+    let (address, server) = spawn_http_listener(vec![format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{frame}\r\n0\r\n\r\n",
+        frame.len()
+    )]);
+    let factory = HttpClientFactory::new(OutboundProxyPolicy::RespectSystemProxy)
+        .with_dedicated_proxy(format!("http://codex:test-password@{address}"));
+    let client = factory
+        .build_client("http://example.invalid/responses", ClientRouteClass::Api)
+        .unwrap();
+    let response = client
+        .get("http://example.invalid/responses")
+        .send()
+        .await
+        .unwrap();
+    let mut stream = response.bytes_stream();
+    let mut received = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        received.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(received, frame.as_bytes());
+    let requests = server.join().unwrap();
+    assert!(
+        requests[0]
+            .to_ascii_lowercase()
+            .contains("proxy-authorization: basic ")
+    );
 }
 
 fn spawn_redirect_listener(

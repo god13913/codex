@@ -94,3 +94,15 @@ CHANGELOG.ignore.md
 # Python bytecode files
 __pycache__/
 *.pyc
+
+# Windows proxy packaging outputs
+/configurator/bin/
+/configurator/obj/
+/configurator/Assets/runtime.zip
+/configurator/Assets/runtime-manifest.json
+/configurator/Assets/notices.zip
+/configurator/Assets/notices.before-webview2.zip
+/build-tools/**/bin/
+/build-tools/**/obj/
+/runtime/
+/release/

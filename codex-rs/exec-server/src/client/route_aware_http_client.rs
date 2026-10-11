@@ -80,6 +80,20 @@ pub(crate) struct RouteAwareHttpRequestRunner {
 
 impl RouteAwareHttpClient {
     pub fn new(http_client_factory: HttpClientFactory) -> Self {
+        // This capability serves MCP and delegated tools, never service-owned model traffic.
+        Self::new_with_factory(http_client_factory.without_dedicated_proxy())
+    }
+
+    /// Builds the client used by service-owned MCP transports and OAuth flows.
+    ///
+    /// Unlike the delegated `http/request` capability above, this path must preserve the
+    /// dedicated proxy configured by the app-server. It is still the same route-aware
+    /// transport, so loopback destinations remain direct and no system-wide proxy is changed.
+    pub fn new_for_service(http_client_factory: HttpClientFactory) -> Self {
+        Self::new_with_factory(http_client_factory)
+    }
+
+    fn new_with_factory(http_client_factory: HttpClientFactory) -> Self {
         Self {
             follow_redirects: RouteAwareClientPool::with_chatgpt_cloudflare_cookies_without_request_logging(
                 http_client_factory.clone(),
@@ -376,4 +390,32 @@ fn log_send_error(method: &Method, error: RouteAwareRequestError) {
         error = %error,
         "http/request send failed"
     );
+}
+
+#[cfg(test)]
+mod dedicated_proxy_tests {
+    #[test]
+    fn delegated_http_capability_preserves_original_policy() {
+        let factory = codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        )
+        .with_system_proxy_fallback()
+        .with_dedicated_proxy("http://codex:test-password@127.0.0.1:17899".into());
+        assert!(!factory.allows_system_proxy_fallback());
+        let tool = super::RouteAwareHttpClient::new(factory);
+        assert!(tool.follow_redirects.allows_system_proxy_fallback());
+        assert!(tool.stop_redirects.allows_system_proxy_fallback());
+    }
+
+    #[test]
+    fn service_http_capability_preserves_dedicated_proxy() {
+        let factory = codex_http_client::HttpClientFactory::new(
+            codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+        )
+        .with_system_proxy_fallback()
+        .with_dedicated_proxy("http://codex:test-password@127.0.0.1:17899".into());
+        let service = super::RouteAwareHttpClient::new_for_service(factory);
+        assert!(!service.follow_redirects.allows_system_proxy_fallback());
+        assert!(!service.stop_redirects.allows_system_proxy_fallback());
+    }
 }

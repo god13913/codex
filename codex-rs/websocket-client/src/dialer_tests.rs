@@ -38,6 +38,54 @@ use crate::WebSocketConnector;
 use crate::WebSocketTlsMode;
 
 #[tokio::test]
+async fn dedicated_factory_routes_websocket_through_authenticated_proxy() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let proxy = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut headers = Vec::new();
+        loop {
+            headers.push(stream.read_u8().await.unwrap());
+            if headers.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            assert!(headers.len() < 8192);
+        }
+        let headers = String::from_utf8(headers).unwrap().to_ascii_lowercase();
+        assert!(headers.starts_with("connect example.invalid:80 "));
+        assert!(headers.contains("proxy-authorization: basic "));
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+        let mut websocket = accept_async(stream).await.unwrap();
+        websocket
+            .send(Message::Text("proxied".into()))
+            .await
+            .unwrap();
+    });
+    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+        .with_system_proxy_fallback()
+        .with_dedicated_proxy(format!("http://codex:test-password@{address}"));
+    let connector =
+        WebSocketConnector::new_with_tls_mode(&factory, WebSocketTlsMode::TungsteniteDefault)
+            .unwrap();
+    let request = "ws://example.invalid/v1/responses"
+        .into_client_request()
+        .unwrap();
+    let (mut connection, response) = connector
+        .connect(request, WebSocketConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 101);
+    assert_eq!(
+        connection.next().await.unwrap().unwrap(),
+        Message::Text("proxied".into())
+    );
+    proxy.await.unwrap();
+}
+
+#[tokio::test]
 async fn public_connector_uses_factory_and_exposes_stream_and_sink() {
     let (target_addr, target_task) = start_echo_websocket_server(/*acceptor*/ None).await;
     let request = format!("ws://localhost:{}/v1/responses", target_addr.port())

@@ -8,6 +8,69 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tracing_subscriber::layer::SubscriberExt;
 
+#[tokio::test]
+async fn dedicated_proxy_survives_legacy_auth_and_cookie_client_constructors() {
+    use std::io::Read;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut headers = Vec::new();
+            let mut byte = [0];
+            while !headers.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            let request = String::from_utf8(headers).unwrap();
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization: basic ")
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        }
+    });
+    let factory = HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault)
+        .with_dedicated_proxy(format!("http://codex:test@{address}"));
+    let route = crate::AuthRouteConfig::from_http_client_factory(factory.clone());
+    let endpoint = "http://example.invalid/token";
+    let auth = create_default_auth_client(endpoint, &route).unwrap();
+    assert_eq!(
+        auth.get(endpoint).send().await.unwrap().status().as_u16(),
+        200
+    );
+    let api = create_client_with_chatgpt_cookies(&factory);
+    assert_eq!(
+        api.get(endpoint).send().await.unwrap().status().as_u16(),
+        200
+    );
+    let asynchronous = create_client_for_route_async(
+        factory,
+        endpoint.into(),
+        ClientRouteClass::Auth,
+        ClientRedirectPolicy::Default,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        asynchronous
+            .get(endpoint)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        200
+    );
+    server.join().unwrap();
+}
+
 #[derive(Clone)]
 struct TestLogWriter {
     buffer: Arc<Mutex<Vec<u8>>>,
