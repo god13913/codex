@@ -1,93 +1,75 @@
-# Codex Windows 专属代理定制版
+# Codex + Mihomo：Windows 专属代理版
 
-这是基于 [OpenAI 官方 Codex](https://github.com/openai/codex) 的非官方 Fork。此分支为 Windows 的 Codex CLI 增加服务请求专属代理、单节点订阅管理，以及与原安装 ChatGPT 桌面配合的定向 TCP 转发。官方桌面安装文件不包含在本仓库中。
+让 Codex CLI 和官方 ChatGPT Windows 桌面端使用一条独立代理，不改系统代理，也不让其他程序跟着走。
 
-- [定制功能、配置与验证范围](docs/dedicated-proxy.md)
-- [安装器与界面源码](web-preview/README.md)
-- [Windows 构建与发布说明](docs/windows-release.md)
-- [构建物与安装包](https://github.com/god13913/codex/releases)
+这是一个基于 [OpenAI Codex](https://github.com/openai/codex) 的非官方 Windows 分支。它会按需启动内置的 Mihomo，把 Codex 的服务请求交给你选定的节点；如果你还在使用官方 ChatGPT 桌面端，也可以让它共用同一条线路。
 
-Codex 源码沿用 Apache-2.0；Mihomo、ProxyBridge、WinDivert 等组件保留各自的许可证及来源说明。当前交付已完成编译、清单哈希和安装包隐私审计；账户、模型请求与桌面转发未做运行验证。下方为官方项目原有说明。
+官方 ChatGPT 桌面程序、订阅和节点都不包含在本仓库中。
 
----
-<p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
-<p align="center">
-  <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
-</p>
-</br>
-If you want Codex in your code editor (VS Code, Cursor, Windsurf), <a href="https://developers.openai.com/codex/ide">install in your IDE.</a>
-</br>If you want the desktop app experience, run <code>codex app</code> or visit <a href="https://chatgpt.com/codex?app-landing-page=true">the Codex App page</a>.
-</br>If you are looking for the <em>cloud-based agent</em> from OpenAI, <strong>Codex Web</strong>, go to <a href="https://chatgpt.com/codex">chatgpt.com/codex</a>.</p>
+## 为什么做这个版本
 
----
+我只想给 Codex 单独准备一条稳定线路，不想为了它一直开着全局代理或 TUN，也不希望浏览器、终端和其他软件被一起改路由。
 
-## Quickstart
+这个分支解决的就是这一个问题。它不是通用代理客户端，也不打算取代 Clash Verge、Mihomo Party 一类工具。
 
-### Installing and running Codex CLI
+## 它能做什么
 
-Run the following on Mac or Linux to install Codex CLI:
+- **Codex 专属代理**：模型请求、账户请求和登录刷新使用独立的 Mihomo 会话。
+- **桌面端共用线路**：已登记的官方 `ChatGPT.exe` 可以和 Codex 使用同一个出口。
+- **订阅与单节点导入**：支持兼容的 Mihomo / Clash 配置和受支持的单条分享链接，并保留有效缓存。
+- **图形化配置**：可以新建、搜索、编辑、导入、导出和选择配置，也能查看已遮罩的当前 CLI 出口 IPv4。
+- **尽量少动系统**：不修改系统代理、路由表、DNS 或 TUN；其他程序仍按原来的网络方式连接。
+- **本地隔离**：Mihomo 的代理端口和控制端口只监听本机回环地址，并使用随机端口和独立认证信息。
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
-```
+桌面透明转发需要一次 Windows UAC 授权。取消授权不会影响 Codex CLI 的专属代理，只是桌面端不会被接入。
 
-Run the following on Windows to install Codex CLI:
+## 开始使用
 
-```shell
-powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"
-```
+### 用图形界面配置
 
-The standalone installers download from `https://releases.openai.com/codex` by default and fall back to GitHub Releases if a metadata or asset download is unavailable. To force GitHub Releases, set `CODEX_INSTALLER_USE_RELEASES_OPENAI_COM` to `false` (`0` and `no` are also accepted):
+1. 前往 [Releases](https://github.com/god13913/codex/releases) 下载最新的 `CodexProxySetup.exe`。
+2. 打开配置工具；如果需要桌面端共用线路，选择电脑上已经安装的官方 `ChatGPT.exe`。
+3. 导入订阅、配置文件或分享链接，选中要使用的出口并保存。
+4. 启动 Codex。桌面转发首次启用时，Windows 会显示 UAC 提示。
 
-```shell
-curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
-```
+配置工具不会替换或修改官方 ChatGPT 的安装文件。
+
+### 只用命令行
+
+如果订阅 URL 已经在剪贴板中，可以通过标准输入配置，避免把地址留在命令历史里：
 
 ```powershell
-$env:CODEX_INSTALLER_USE_RELEASES_OPENAI_COM='false'; irm https://chatgpt.com/codex/install.ps1 | iex
+Get-Clipboard | .\codex.exe proxy configure --stdin
+.\codex.exe proxy status
 ```
 
-Codex CLI can also be installed via the following package managers:
+`proxy status` 只显示脱敏后的状态。需要立即更新缓存时，可以运行：
 
-```shell
-# Install using npm
-npm install -g @openai/codex
+```powershell
+.\codex.exe proxy refresh
 ```
 
-```shell
-# Install using Homebrew
-brew install --cask codex
-```
+桌面端接入、`CODEX_CLI_PATH` 和恢复方法见 [专属代理使用说明](docs/dedicated-proxy.md)。
 
-Then simply run `codex` to get started.
+## 使用前要知道
 
-<details>
-<summary>You can also go to the <a href="https://github.com/openai/codex/releases/latest">latest GitHub Release</a> and download the appropriate binary for your platform.</summary>
+- 当前版本面向 **Windows x64**。
+- 你需要自行准备可用的订阅、节点或分享链接。
+- 桌面转发只处理已登记的官方 ChatGPT 进程的 TCP 80/443 流量；其他进程不会被接管。
+- 桌面的 UDP 443 会被阻断，让 QUIC 回退到 TCP；这不会关闭系统其他程序的 UDP。
+- 代理不会修改 TLS 证书校验，也不会在服务器上创建公开代理。
+- 这是非官方分支，账号、节点和桌面版本不同都可能影响实际效果。第一次使用时建议保留原来的 Codex 安装方式，方便随时切回。
 
-Each GitHub Release contains many executables, but in practice, you likely want one of these:
+## 更多资料
 
-- macOS
-  - Apple Silicon/arm64: `codex-aarch64-apple-darwin.tar.gz`
-  - x86_64 (older Mac hardware): `codex-x86_64-apple-darwin.tar.gz`
-- Linux
-  - x86_64: `codex-x86_64-unknown-linux-musl.tar.gz`
-  - arm64: `codex-aarch64-unknown-linux-musl.tar.gz`
+- [专属代理的工作方式与配置](docs/dedicated-proxy.md)
+- [配置界面说明](web-preview/README.md)
+- [Windows 构建与发布](docs/windows-release.md)
+- [下载构建物与安装包](https://github.com/god13913/codex/releases)
+- [OpenAI Codex 官方仓库](https://github.com/openai/codex)
 
-Each archive contains a single entry with the platform baked into the name (e.g., `codex-x86_64-unknown-linux-musl`), so you likely want to rename it to `codex` after extracting it.
+## 许可证
 
-</details>
+Codex 源码沿用 [Apache-2.0](LICENSE)。随发行包提供的 Mihomo、ProxyBridge 和 WinDivert 保留各自的许可证与来源说明。
 
-### Using Codex with your ChatGPT plan
-
-Run `codex` and select **Sign in with ChatGPT**. We recommend signing into your ChatGPT account to use Codex as part of your Plus, Pro, Business, Edu, or Enterprise plan. [Learn more about what's included in your ChatGPT plan](https://help.openai.com/en/articles/11369540-codex-in-chatgpt).
-
-You can also use Codex with an API key, but this requires [additional setup](https://developers.openai.com/codex/auth#sign-in-with-an-api-key).
-
-## Docs
-
-- [**Codex Documentation**](https://developers.openai.com/codex)
-- [**Contributing**](./docs/contributing.md)
-- [**Installing & building**](./docs/install.md)
-- [**Open source fund**](./docs/open-source-fund.md)
-
-This repository is licensed under the [Apache-2.0 License](LICENSE).
+这个项目与 OpenAI、MetaCubeX 没有隶属或官方合作关系。
