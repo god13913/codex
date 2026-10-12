@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO.Compression;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 
@@ -81,6 +82,35 @@ internal static class RuntimeInstaller
         };
         File.WriteAllBytes(Path.Combine(runtime, "desktop-forwarding.json"), JsonSerializer.SerializeToUtf8Bytes(registration, PrivateStore.Json));
     }
+
+    /// <summary>
+    /// Reverts the desktop to the official CLI by removing the <c>CODEX_CLI_PATH</c> override.
+    /// </summary>
+    /// <remarks>
+    /// The official desktop selects its bundled CLI whenever <c>CODEX_CLI_PATH</c> is absent,
+    /// so removal is the correct way back. Earlier revisions instead restored a remembered
+    /// "previous_cli_path" value, which broke in three ways: the key is omitted from
+    /// configurator.json when the previous value was null (DefaultIgnoreCondition =
+    /// WhenWritingNull), so reading it threw KeyNotFoundException and cleared nothing; the
+    /// equality guard skipped the whole step whenever the variable did not match the recorded
+    /// runtime; and a remembered path can be stale after a runtime rebuild. Always clear, and
+    /// never depend on stored metadata.
+    /// </remarks>
+    internal static void ClearCliOverride()
+    {
+        Environment.SetEnvironmentVariable("CODEX_CLI_PATH", null, EnvironmentVariableTarget.User);
+        if (Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.User) is not null)
+            throw new InvalidOperationException("无法清除 CLI 设置。");
+        Environment.SetEnvironmentVariable("CODEX_CLI_PATH", null, EnvironmentVariableTarget.Process);
+        BroadcastEnvironment();
+    }
+
+    private static void BroadcastEnvironment() =>
+        SendMessageTimeout(new IntPtr(0xFFFF), 0x001A, IntPtr.Zero, "Environment", 2, 5000, out _);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr value,
+        string text, uint flags, uint timeout, out IntPtr result);
 
     internal static void LaunchDesktop(string path) => Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
 

@@ -346,23 +346,17 @@ internal sealed class ConfiguratorBridge
     private static object DisableProxy()
     {
         using var settings = PrivateStore.Read("settings.json");
-        if (settings is null) return true;
-        var mode = settings.RootElement.GetProperty("mode").GetString();
-        PrivateStore.Write("settings.json", new { Enabled = false, Mode = mode, UpdatedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(), LastError = (string?)null }, false);
-        using var metadata = PrivateStore.Read("configurator.json");
-        if (metadata is not null)
+        if (settings is not null)
         {
-            var current = Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.User);
-            var installed = Path.Combine(metadata.RootElement.GetProperty("runtime_directory").GetString()!, "codex.exe");
-            if (string.Equals(current, installed, StringComparison.OrdinalIgnoreCase))
-            {
-                var prior = metadata.RootElement.GetProperty("previous_cli_path");
-                var value = prior.ValueKind == JsonValueKind.String ? prior.GetString() : null;
-                Environment.SetEnvironmentVariable("CODEX_CLI_PATH", value, EnvironmentVariableTarget.User);
-                Environment.SetEnvironmentVariable("CODEX_CLI_PATH", value, EnvironmentVariableTarget.Process);
-                BroadcastEnvironment();
-            }
+            var mode = settings.RootElement.GetProperty("mode").GetString();
+            PrivateStore.Write("settings.json", new { Enabled = false, Mode = mode, UpdatedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(), LastError = (string?)null }, false);
         }
+        // Clear unconditionally, even when settings.json is absent: a leftover override would
+        // otherwise keep the desktop on the dedicated CLI while the UI reports it as disabled.
+        // Removing the CODEX_CLI_PATH override is what makes the desktop fall back to the
+        // official CLI - see RuntimeInstaller.ClearCliOverride for why we no longer restore a
+        // remembered path or gate this on the recorded runtime directory.
+        RuntimeInstaller.ClearCliOverride();
         return true;
     }
 
