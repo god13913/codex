@@ -5,14 +5,127 @@ param(
     [string]$RegistryBridge = '',
     [string]$TargetDirectory = '',
     [string]$OutputDirectory = '',
+    [string]$RgPath = '',
+    [string]$VoicePackageDirectory = '',
+    # Max concurrent Cargo jobs. 0 or omitted = follow the host CPU (logical cores - 1).
+    [int]$BuildJobs = 0,
     [switch]$DesktopOnly,
     [switch]$FreshBuild,
     [switch]$Offline
 )
 $ErrorActionPreference = 'Stop'
+# No machine-specific default: every caller must pass a pinned Mihomo executable.
 if ($Stage -eq 'Release' -and -not $CorePath) { throw 'Pass -CorePath with a pinned Mihomo executable.' }
+
+# Collapse duplicate-cased environment variables (http_proxy vs HTTP_PROXY, https_proxy vs
+# HTTPS_PROXY). Windows environment names are case-insensitive; importing a batch environment
+# that exports both spellings makes SetEnvironmentVariable fail with "already contains the key".
+foreach ($proxyPair in @(
+        @('http_proxy', 'HTTP_PROXY'),
+        @('https_proxy', 'HTTPS_PROXY'),
+        @('all_proxy', 'ALL_PROXY'),
+        @('no_proxy', 'NO_PROXY')
+    )) {
+    $lower = $proxyPair[0]
+    $upper = $proxyPair[1]
+    $lowerValue = [Environment]::GetEnvironmentVariable($lower, 'Process')
+    $upperValue = [Environment]::GetEnvironmentVariable($upper, 'Process')
+    if ($null -ne $lowerValue -and $null -ne $upperValue) {
+        [Environment]::SetEnvironmentVariable($lower, $null, 'Process')
+    } elseif ($null -ne $lowerValue) {
+        [Environment]::SetEnvironmentVariable($upper, $lowerValue, 'Process')
+        [Environment]::SetEnvironmentVariable($lower, $null, 'Process')
+    }
+}
+
+function Write-Utf8NoBom {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Content
+    )
+
+    [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
+}
+
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $workspaceRoot = Split-Path $repoRoot -Parent
+$voiceEnabled = [bool]$VoicePackageDirectory
+$voiceTarget = 'x86_64-pc-windows-msvc'
+$voicePackageRoot = $null
+$voiceSource = $null
+$voiceInputManifest = $null
+$rgSource = $null
+if ($voiceEnabled) {
+    if ($Stage -ne 'Release') {
+        throw 'VoicePackageDirectory is only valid for the Release stage'
+    }
+    $voicePackageRoot = [IO.Path]::GetFullPath($VoicePackageDirectory)
+    $voiceSource = Join-Path $voicePackageRoot 'codex-resources\voice'
+    $voiceManifestPath = Join-Path $voiceSource 'manifest.json'
+    if (!(Test-Path -LiteralPath $voiceSource -PathType Container)) {
+        throw "Voice package is missing codex-resources\voice: $voiceSource"
+    }
+    if (!(Test-Path -LiteralPath $voiceManifestPath -PathType Leaf)) {
+        throw "Voice package is missing its manifest: $voiceManifestPath"
+    }
+    $voiceInputManifest = Get-Content -LiteralPath $voiceManifestPath -Raw | ConvertFrom-Json
+    $currentBuildCommit = (& git -C $repoRoot rev-parse HEAD).Trim()
+    if ($voiceInputManifest.buildCommit -ne $currentBuildCommit) {
+        throw "Voice package build commit mismatch: expected $currentBuildCommit, got $($voiceInputManifest.buildCommit)"
+    }
+    if ($voiceInputManifest.appTarget -ne $voiceTarget -or $voiceInputManifest.voiceTarget -ne $voiceTarget) {
+        throw "Voice package target mismatch: expected $voiceTarget"
+    }
+    $requiredVoiceFiles = @(
+        'bin\codex-voice-host.exe',
+        'bin\gstreamer-1.0-0.dll',
+        'bin\gio-2.0-0.dll',
+        'bin\gstapp.dll',
+        'bin\gstaudioconvert.dll',
+        'bin\gstaudioresample.dll',
+        'bin\gstcoreelements.dll',
+        'bin\gstopus.dll',
+        'bin\gstrtp.dll',
+        'bin\gstrtpmanager.dll'
+    )
+    foreach ($relative in $requiredVoiceFiles) {
+        $path = Join-Path $voiceSource $relative
+        if (!(Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Voice package is missing required file: $relative"
+        }
+    }
+    $voiceHashEntries = @($voiceInputManifest.sha256.psobject.Properties | Where-Object Name -like 'codex-resources/voice/*')
+    if ($voiceHashEntries.Count -lt $requiredVoiceFiles.Count) {
+        throw 'Voice package manifest does not cover the complete voice payload'
+    }
+    foreach ($entry in $voiceHashEntries) {
+        $relative = [string]$entry.Name
+        $sourcePath = Join-Path $voicePackageRoot ($relative.Replace('/', '\'))
+        if (!(Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+            throw "Voice package manifest references a missing file: $relative"
+        }
+        $actual = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($actual -ne ([string]$entry.Value).ToLowerInvariant()) {
+            throw "Voice package hash mismatch: $relative"
+        }
+    }
+}
+if ($Stage -eq 'Release') {
+    if ($RgPath) {
+        $rgSource = [IO.Path]::GetFullPath($RgPath)
+    } elseif ($voicePackageRoot) {
+        $officialRg = Join-Path $voicePackageRoot 'codex-path\rg.exe'
+        if (Test-Path -LiteralPath $officialRg -PathType Leaf) {
+            $rgSource = $officialRg
+        }
+    }
+    if (!$rgSource -or !(Test-Path -LiteralPath $rgSource -PathType Leaf)) {
+        throw 'Release requires a bundled Windows ripgrep executable; pass -RgPath or provide codex-path\rg.exe in VoicePackageDirectory'
+    }
+    if ([IO.Path]::GetFileName($rgSource) -ine 'rg.exe') {
+        throw "Bundled ripgrep must be named rg.exe: $rgSource"
+    }
+}
 if ($TargetDirectory) {
     $env:CARGO_TARGET_DIR = [IO.Path]::GetFullPath($TargetDirectory)
 } else {
@@ -42,7 +155,18 @@ $env:PATH = $rustBin + ';' + (Join-Path $env:CARGO_HOME 'bin') + ';' + $env:PATH
 $env:RUSTC = Join-Path $rustBin 'rustc.exe'
 $env:CARGO_HTTP_MULTIPLEXING = 'false'
 $env:CARGO_HTTP_TIMEOUT = '120'
-$env:CARGO_BUILD_JOBS = '4'
+# Parallelism: scale with the host CPU instead of the previous hardcoded 4.
+# codegen-units = 4 governs in-crate splitting; CARGO_BUILD_JOBS governs how many
+# crates/codegen units Cargo runs concurrently. Pinning it to 4 throttled release
+# builds to a fraction of the available cores. Default to all logical cores, leave
+# one free so the desktop stays responsive, and let -BuildJobs override explicitly.
+$logicalCores = [Environment]::ProcessorCount
+if ($logicalCores -lt 1) { $logicalCores = 1 }
+if ($BuildJobs -gt 0) {
+    $env:CARGO_BUILD_JOBS = [string]$BuildJobs
+} else {
+    $env:CARGO_BUILD_JOBS = [string][Math]::Max(1, $logicalCores - 1)
+}
 $env:CARGO_NET_GIT_FETCH_WITH_CLI = 'true'
 # These overrides affect only this build process and never persistent Git configuration.
 $env:GIT_CONFIG_COUNT = '1'
@@ -140,8 +264,16 @@ $installation = & $vswhere -latest -products '*' -requires Microsoft.VisualStudi
 if (!$installation) { throw 'Visual Studio C++ build tools are required' }
 $devCommand = Join-Path $installation 'Common7\Tools\VsDevCmd.bat'
 $devEnvironment = & cmd.exe /d /s /c "`"`"$devCommand`" -arch=x64 -host_arch=x64 >nul && set`""
+# Windows environment variables are case-insensitive, so a batch environment that exports
+# both http_proxy and HTTP_PROXY makes SetEnvironmentVariable throw "already contains the
+# key". Track the keys we have applied and keep only the last occurrence of each name.
+$appliedEnvKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 foreach ($entry in $devEnvironment) {
-    if ($entry -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process') }
+    if ($entry -match '^([^=]+)=(.*)$') {
+        $key = $Matches[1]
+        if (!$appliedEnvKeys.Add($key)) { continue }
+        [Environment]::SetEnvironmentVariable($key, $Matches[2], 'Process')
+    }
 }
 $localSdk = Join-Path $toolchainRoot 'windows-sdk\c'
 if (Test-Path -LiteralPath (Join-Path $localSdk 'um\x64\kernel32.Lib')) {
@@ -209,9 +341,66 @@ try {
         $destination = if ($OutputDirectory) { [IO.Path]::GetFullPath($OutputDirectory) } else { Join-Path $workspaceRoot 'release\CodexDedicated' }
         New-Item -ItemType Directory -Path $destination -Force | Out-Null
         if ((Get-FileHash -LiteralPath $CorePath -Algorithm SHA256).Hash -ne '3C107D54EF1B895E4980B53F517D52F3C1137101FA2637347C9CE343FC50D7B2') { throw 'Pinned Mihomo checksum mismatch' }
+        $packageResources = Join-Path $destination 'codex-resources'
+        $packagePath = Join-Path $destination 'codex-path'
+        New-Item -ItemType Directory -Path $packageResources, $packagePath -Force | Out-Null
         foreach ($binary in $releaseBinaries) {
-            Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR "release\$binary.exe") -Destination $destination
+            if ($binary -ne 'codex-voice-host') {
+                $binarySource = Join-Path $env:CARGO_TARGET_DIR "release\$binary.exe"
+                # Keep the root copy for the dedicated launcher and legacy helper lookup.
+                Copy-Item -LiteralPath $binarySource -Destination $destination
+                if ($binary -in @('codex-command-runner', 'codex-windows-sandbox-setup')) {
+                    # Also provide the canonical official package location.
+                    Copy-Item -LiteralPath $binarySource -Destination $packageResources
+                }
+            }
         }
+        # Guard against a self-referential copy: the caller may pass an rg.exe that was
+        # already taken from this packaging output directory. Copying a file onto itself
+        # raises an IOException and aborts packaging.
+        $rgDestination = Join-Path $packagePath 'rg.exe'
+        $sameRg = [IO.Path]::GetFullPath($rgSource).TrimEnd('\') -eq [IO.Path]::GetFullPath($rgDestination).TrimEnd('\')
+        if (!$sameRg) {
+            Copy-Item -LiteralPath $rgSource -Destination $rgDestination -Force
+        }
+        if ($voiceEnabled) {
+            $voiceDestination = Join-Path $destination 'codex-resources\voice'
+            New-Item -ItemType Directory -Path $voiceDestination -Force | Out-Null
+            foreach ($item in (Get-ChildItem -LiteralPath $voiceSource -Force)) {
+                Copy-Item -LiteralPath $item.FullName -Destination $voiceDestination -Recurse -Force
+            }
+            $voiceManifestHashes = [ordered]@{}
+            $voiceManifestHashes['codex.exe'] = (Get-FileHash -LiteralPath (Join-Path $destination 'codex.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+            foreach ($entry in $voiceHashEntries) {
+                $relative = [string]$entry.Name
+                $destinationPath = Join-Path $destination ($relative.Replace('/', '\'))
+                $actual = (Get-FileHash -LiteralPath $destinationPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($actual -ne ([string]$entry.Value).ToLowerInvariant()) {
+                    throw "Copied voice payload changed: $relative"
+                }
+                $voiceManifestHashes[$relative] = $actual
+            }
+            $voiceManifest = [ordered]@{
+                schemaVersion = 1
+                buildCommit = $voiceInputManifest.buildCommit
+                appTarget = $voiceTarget
+                voiceTarget = $voiceTarget
+                appVersion = '0.162.0+dedicated'
+                sha256 = $voiceManifestHashes
+            }
+            Write-Utf8NoBom -Path (Join-Path $voiceDestination 'manifest.json') -Content ($voiceManifest | ConvertTo-Json -Depth 6)
+        }
+        $packageMetadata = [ordered]@{
+            layoutVersion = 1
+            version = '0.162.0+dedicated'
+            target = $voiceTarget
+            variant = 'codex'
+            # The dedicated distribution keeps codex.exe at its historical root path.
+            entrypoint = 'codex.exe'
+            resourcesDir = 'codex-resources'
+            pathDir = 'codex-path'
+        }
+        Write-Utf8NoBom -Path (Join-Path $destination 'codex-package.json') -Content ($packageMetadata | ConvertTo-Json -Depth 4)
         Copy-Item -LiteralPath $CorePath -Destination (Join-Path $destination 'codex-mihomo.exe')
         Copy-Item -LiteralPath (Join-Path $nativeOutput 'ProxyBridge.dll') -Destination $destination
         $windivert = Join-Path $workspaceRoot 'third-party\windivert-2.2.2'
@@ -244,13 +433,19 @@ try {
             if (!(Test-Path -LiteralPath $materialPath)) { throw "Missing Mihomo distribution material: $material" }
             Copy-Item -LiteralPath $materialPath -Destination $destination
         }
-        Set-Content -LiteralPath (Join-Path $destination 'codex-dedicated-proxy.distribution') -Value 'Codex 0.162.0 + Mihomo 1.19.32'
-        @{ success=$true; stage='Release'; targetDirectory=$env:CARGO_TARGET_DIR; outputDirectory=$destination;
-           freshBuild=[bool]$FreshBuild; testsRun=$false; completedAt=[DateTimeOffset]::Now.ToString('o') } |
-            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $destination 'build-result.json') -Encoding utf8
-        Get-ChildItem -LiteralPath $destination -File | Where-Object Name -ne 'SHA256SUMS.txt' | ForEach-Object {
-            '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash, $_.Name
-        } | Set-Content -LiteralPath (Join-Path $destination 'SHA256SUMS.txt')
+        $distributionLabel = if ($voiceEnabled) { 'Codex 0.162.0 + Mihomo 1.19.32 + official voice runtime' } else { 'Codex 0.162.0 + Mihomo 1.19.32' }
+        Write-Utf8NoBom -Path (Join-Path $destination 'codex-dedicated-proxy.distribution') -Content $distributionLabel
+        $buildResultJson = @{ success=$true; stage='Release'; targetDirectory=$env:CARGO_TARGET_DIR; outputDirectory=$destination;
+           freshBuild=[bool]$FreshBuild; voiceEnabled=$voiceEnabled; testsRun=$false; completedAt=[DateTimeOffset]::Now.ToString('o') } |
+           ConvertTo-Json
+        Write-Utf8NoBom -Path (Join-Path $destination 'build-result.json') -Content $buildResultJson
+        $checksumLines = @(Get-ChildItem -LiteralPath $destination -File -Recurse | Where-Object FullName -ne (Join-Path $destination 'SHA256SUMS.txt') | ForEach-Object {
+            # [IO.Path]::GetRelativePath requires .NET Core / PS7; this script is launched
+            # by Windows PowerShell 5.1, so compute the relative path manually.
+            $relative = $_.FullName.Substring($destination.Length).TrimStart('\').Replace('\', '/')
+            '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash, $relative
+        })
+        Write-Utf8NoBom -Path (Join-Path $destination 'SHA256SUMS.txt') -Content ($checksumLines -join [Environment]::NewLine)
         Write-Output "Custom distribution: $destination"
     }
 } finally { Pop-Location }
