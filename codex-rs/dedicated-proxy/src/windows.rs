@@ -53,6 +53,37 @@ pub fn private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Shows a modal error dialog telling the operator that the fixed proxy port is
+/// already held by another program. Windows only; other platforms ignore the call.
+#[cfg(windows)]
+pub fn alert_port_in_use(port: u16) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    };
+    let caption: Vec<u16> = OsStr::new("Codex 专用代理")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let text = format!(
+        "专用代理端口 {port} 已被其他程序占用，内核无法启动。\r\n\r\n\
+         请关闭占用该端口的程序，或在 settings.json 中修改 proxy_port 后重试。"
+    );
+    let body: Vec<u16> = OsStr::new(&text).encode_wide().chain(Some(0)).collect();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn alert_port_in_use(_port: u16) {}
+
 #[cfg(windows)]
 pub struct Job {
     _handle: std::os::windows::io::OwnedHandle,

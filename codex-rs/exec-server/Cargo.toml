@@ -29,6 +29,7 @@ codex-api = { workspace = true }
 codex-build-info = { workspace = true }
 codex-config = { workspace = true }
 codex-core-plugin-common = { workspace = true }
+codex-dedicated-proxy = { workspace = true }
 codex-http-client = { workspace = true }
 codex-exec-server-protocol = { workspace = true }
 codex-file-system = { workspace = true }

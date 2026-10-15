@@ -3253,6 +3253,7 @@ dependencies = [
  "codex-build-info",
  "codex-config",
  "codex-core-plugin-common",
+ "codex-dedicated-proxy",
  "codex-exec-server-protocol",
  "codex-exec-server-test-support",
  "codex-file-system",

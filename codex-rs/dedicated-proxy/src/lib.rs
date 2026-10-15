@@ -1,6 +1,7 @@
 //! Private subscription transport for Codex service requests. No global proxy environment changes.
 #[cfg(windows)]
 mod desktop;
+mod dns_forwarder;
 mod storage;
 mod windows;
 
@@ -11,6 +12,7 @@ use std::io::{IsTerminal, Read};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -27,6 +29,14 @@ struct Runtime {
     controller_secret: String,
     proxy_port: u16,
     password: String,
+    dns_nameservers: Vec<String>,
+    dns_bootstrap: Vec<String>,
+    /// Loopback resolver that reaches DoH through this kernel, if one could be started.
+    dns_resolver: Option<String>,
+    /// Consecutive failures of that resolver, shared with the running task.
+    dns_resolver_failures: Arc<AtomicUsize>,
+    /// Kept only so the resolver task lives as long as the runtime.
+    _resolver: Option<dns_forwarder::Forwarder>,
     child: Mutex<Child>,
     #[cfg(windows)]
     bridge: Mutex<Option<desktop::BridgeLease>>,
@@ -60,6 +70,29 @@ pub fn active_proxy_url() -> Option<String> {
 
 pub fn enabled(home: &Path) -> Result<bool> {
     Ok(storage::settings(home)?.enabled)
+}
+
+/// Fixed local endpoint for processes that should reuse the kernel another process
+/// already started, instead of starting a second one. Returns `None` when the
+/// dedicated proxy is disabled or its settings cannot be read.
+pub fn proxy_endpoint(home: &Path) -> Option<String> {
+    let settings = storage::settings(home).ok()?;
+    storage::endpoint_for(&settings)
+}
+
+/// Resolves CODEX_HOME the same way the diagnostic entrypoint does, so callers that
+/// do not already carry a home path can still find the endpoint.
+fn default_codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE").map(|value| PathBuf::from(value).join(".codex"))
+        })
+}
+
+/// Convenience wrapper around [`proxy_endpoint`] for standalone processes.
+pub fn configured_proxy_endpoint() -> Option<String> {
+    proxy_endpoint(&default_codex_home()?)
 }
 
 pub fn custom_distribution() -> bool {
@@ -106,6 +139,61 @@ fn private_client() -> Result<reqwest::Client> {
         .map_err(|_| anyhow::anyhow!("cannot create private kernel control client"))
 }
 
+/// Builds the kernel's `dns` section.
+///
+/// The kernel resolves a hostname locally before dialling the node, and a poisoned OS
+/// resolver makes every tunnel stall on a dead address until a retry re-resolves the name.
+/// The kernel cannot send DNS through a proxy, so instead it is pointed at a loopback
+/// resolver (see [`dns_forwarder`]) whose upstream DoH leaves through this very kernel -
+/// that is what puts the lookup on the far side of the node. An operator-supplied
+/// `dns_nameservers` list takes precedence when the forwarder could not start, and an
+/// explicitly empty list turns kernel-side resolution off altogether.
+///
+/// `proxy-server-nameserver` is what keeps that arrangement from deadlocking: the node's
+/// own host name must be resolved directly over plain domestic resolvers, because
+/// resolving it through the loopback resolver would require the very tunnel that requires
+/// the node's address first. Mihomo otherwise resolves the node host name with the
+/// default `nameserver`, which is exactly the loop observed in kernel logs
+/// (`dial CODEX: dns resolve failed` while every lookup queued behind the dead tunnel).
+fn dns_section(runtime: &Runtime) -> serde_json::Value {
+    // Stop pointing the kernel at the forwarder once it has failed repeatedly, so a dead
+    // resolver degrades to the operator's list instead of stalling every lookup.
+    let resolver = match runtime.dns_resolver.as_ref() {
+        Some(address)
+            if runtime.dns_resolver_failures.load(Ordering::Relaxed)
+                < dns_forwarder::FAILURE_LIMIT =>
+        {
+            Some(address.as_str())
+        }
+        _ => None,
+    };
+    dns_section_from(resolver, &runtime.dns_nameservers, &runtime.dns_bootstrap)
+}
+
+/// Pure form of [`dns_section`] so the invariants can be unit-tested without a live
+/// kernel runtime. `bootstrap` must be non-empty (guaranteed by
+/// [`storage::effective_dns_bootstrap`]).
+fn dns_section_from(
+    resolver: Option<&str>,
+    nameservers: &[String],
+    bootstrap: &[String],
+) -> serde_json::Value {
+    if resolver.is_none() && nameservers.is_empty() {
+        return json!({"enable": false});
+    }
+    let servers: Vec<String> = match resolver {
+        Some(address) => vec![format!("udp://{address}")],
+        None => nameservers.to_vec(),
+    };
+    // `default-nameserver` bootstraps operator-supplied DoH endpoints and is rejected by
+    // Mihomo when empty; `proxy-server-nameserver` pins the node's own host name to the
+    // same direct resolvers so it can never depend on the forwarder (see the doc comment
+    // on [`dns_section`]). Neither costs anything while the forwarder is in use.
+    json!({"enable": true, "ipv6": false, "prefer-h3": false, "use-hosts": true,
+        "default-nameserver": bootstrap,
+        "proxy-server-nameserver": bootstrap, "nameserver": servers})
+}
+
 fn configuration(runtime: &Runtime, node: &serde_yaml::Mapping) -> Result<String> {
     let node = serde_json::to_value(node)
         .map_err(|_| anyhow::anyhow!("cannot serialize validated node"))?;
@@ -118,7 +206,8 @@ fn configuration(runtime: &Runtime, node: &serde_yaml::Mapping) -> Result<String
         "authentication": if runtime.password.is_empty() { Vec::<String>::new() } else { vec![format!("codex:{}", runtime.password)] },
         "skip-auth-prefixes": [],
         "external-controller": runtime.controller, "secret": runtime.controller_secret,
-        "tun": {"enable": false}, "dns": {"enable": false},
+        "tun": {"enable": false},
+        "dns": dns_section(runtime),
         "sniffer": {"enable": true, "parse-pure-ip": true,
             "sniff": {"TLS": {"ports": [443], "override-destination": true},
                 "HTTP": {"ports": [80], "override-destination": true}}},
@@ -204,15 +293,45 @@ pub async fn start_if_enabled(home: &Path) -> Result<Option<ProxyGuard>> {
         .tempdir_in(&root)
         .context("cannot create private kernel runtime")?;
     windows::private_directory(runtime_dir.path())?;
-    // Reserve both ports simultaneously, then release immediately before starting the kernel.
-    let proxy_listener =
-        TcpListener::bind("127.0.0.1:0").context("cannot reserve private proxy port")?;
+    // Use the configured fixed proxy port so sibling processes (a standalone
+    // exec-server, for example) can reach this kernel instead of starting a second
+    // one. The control port stays ephemeral: only this process ever talks to it.
+    let proxy_port = storage::effective_proxy_port(&settings);
+    let proxy_listener = match TcpListener::bind(("127.0.0.1", proxy_port)) {
+        Ok(listener) => listener,
+        Err(_) => {
+            windows::alert_port_in_use(proxy_port);
+            bail!(
+                "dedicated proxy port {proxy_port} is already in use; close the program \
+                 holding it or change proxy_port in settings.json"
+            );
+        }
+    };
     let control_listener =
         TcpListener::bind("127.0.0.1:0").context("cannot reserve private control port")?;
-    let proxy_port = proxy_listener.local_addr()?.port();
     let controller = control_listener.local_addr()?.to_string();
     let secret = random_secret();
-    let password = random_secret();
+    let password = storage::effective_proxy_password(&settings);
+    // Start the loopback resolver before the kernel exists: it binds a port now and only
+    // needs the kernel once a query actually arrives. An explicitly empty `dns_nameservers`
+    // is the operator's opt-out from kernel-side resolution, forwarder included.
+    let kernel_dns = !storage::effective_dns_nameservers(&settings).is_empty();
+    let mut resolver = None;
+    let mut resolver_failures = Arc::new(AtomicUsize::new(0));
+    if kernel_dns {
+        match dns_forwarder::start(proxy_port, &password).await {
+            Ok(value) => {
+                resolver_failures = value.failures_counter();
+                resolver = Some(value);
+            }
+            Err(error) => {
+                // Degrade to the configured resolvers, but leave a trace: a silent failure
+                // here looks like "DNS is slow" and is otherwise impossible to diagnose.
+                settings.last_error = Some(format!("dedicated resolver unavailable: {error}"));
+                let _ = storage::save_settings(home, &settings);
+            }
+        }
+    }
     let bootstrap = serde_json::to_string(&json!({
         "port": 0, "socks-port": 0, "mixed-port": 0, "allow-lan": false,
         "bind-address": "127.0.0.1", "log-level": "silent", "mode": "rule", "find-process-mode": "off",
@@ -256,6 +375,11 @@ pub async fn start_if_enabled(home: &Path) -> Result<Option<ProxyGuard>> {
         controller_secret: secret,
         proxy_port,
         password,
+        dns_nameservers: storage::effective_dns_nameservers(&settings),
+        dns_bootstrap: storage::effective_dns_bootstrap(&settings),
+        dns_resolver: resolver.as_ref().map(|value| value.address().to_string()),
+        dns_resolver_failures: resolver_failures,
+        _resolver: resolver,
         child: Mutex::new(child),
         #[cfg(windows)]
         bridge: Mutex::new(None),
@@ -637,6 +761,7 @@ mod tests {
                 mode: storage::Mode::Subscription,
                 updated_at: storage::now(),
                 last_error: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -673,5 +798,40 @@ mod tests {
         std::fs::write(dir.join("subscription.json"), "SECRET_NOT_JSON").unwrap();
         let error = storage::cache(home.path()).err().unwrap().to_string();
         assert!(!error.contains("SECRET"));
+    }
+
+    #[test]
+    fn dns_section_never_resolves_the_node_through_the_forwarder() {
+        let bootstrap = vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()];
+        // Forwarder running: only client names go through the loopback resolver ...
+        let value = dns_section_from(Some("127.0.0.1:52220"), &[], &bootstrap);
+        assert_eq!(value["enable"], json!(true));
+        assert_eq!(value["nameserver"][0], "udp://127.0.0.1:52220");
+        // ... while the node's own host name resolves directly: pointing it at the
+        // forwarder deadlocks on the tunnel that needs the node address first.
+        assert_eq!(
+            value["proxy-server-nameserver"],
+            json!(["223.5.5.5", "119.29.29.29"])
+        );
+        assert_eq!(
+            value["default-nameserver"],
+            json!(["223.5.5.5", "119.29.29.29"])
+        );
+        // A failed forwarder degrades to the operator's DoH list, same guarantees.
+        let value = dns_section_from(
+            None,
+            &["https://doh.pub/dns-query".to_string()],
+            &bootstrap,
+        );
+        assert_eq!(value["nameserver"], json!(["https://doh.pub/dns-query"]));
+        assert_eq!(
+            value["proxy-server-nameserver"],
+            json!(["223.5.5.5", "119.29.29.29"])
+        );
+        // No resolver and no operator list disables kernel-side resolution entirely.
+        assert_eq!(
+            dns_section_from(None, &[], &bootstrap),
+            json!({"enable": false})
+        );
     }
 }

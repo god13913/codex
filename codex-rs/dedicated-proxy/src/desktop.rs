@@ -524,6 +524,13 @@ fn run_inner(path: &Path, request: &Request, session: &session::Session) -> Resu
     let stop = function!("ProxyBridge_Stop", unsafe extern "C" fn() -> i32);
     let sid = CString::new(request.owner_sid.as_str())?;
     let process = CString::new(request.desktop_executable.to_string_lossy().as_bytes())?;
+    // The CLI itself owns service-owned channels that deliberately bypass the in-process
+    // dedicated proxy (remote exec-server/cloud environments, telemetry). Those connections
+    // would otherwise leave the machine directly and stall on handshake in restricted
+    // networks. Cover the CLI executable with the same forwarding rule so every outbound
+    // TCP 80/443 from this distribution reaches the local kernel. The kernel binary has a
+    // different file name, so it is never matched and cannot loop through itself.
+    let cli = CString::new(std::env::current_exe()?.to_string_lossy().as_bytes())?;
     let password = CString::new(request.proxy_password.as_str())?;
     unsafe {
         if set_owner(sid.as_ptr()) == 0 {
@@ -555,6 +562,15 @@ fn run_inner(path: &Path, request: &Request, session: &session::Session) -> Resu
                 c"".as_ptr(),
                 1,
                 2,
+                proxy,
+            ) == 0
+            || add_rule(
+                cli.as_ptr(),
+                c"*".as_ptr(),
+                c"80;443".as_ptr(),
+                c"".as_ptr(),
+                0,
+                0,
                 proxy,
             ) == 0
         {
