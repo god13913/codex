@@ -108,11 +108,19 @@ impl EnvironmentRegistryClient {
         http_client_factory: HttpClientFactory,
     ) -> Result<Self, ExecServerError> {
         let base_url = normalize_base_url(base_url)?;
+        // This channel used to strip the dedicated proxy, which left a standalone
+        // exec-server dialling cloud-environment IPs directly where they are blocked.
+        // Re-bind the dedicated proxy here so registry traffic reaches the local
+        // kernel. When the dedicated proxy is disabled this is a no-op.
+        let http_client_factory = match codex_dedicated_proxy::configured_proxy_endpoint() {
+            Some(endpoint) => http_client_factory.with_dedicated_proxy(endpoint),
+            None => http_client_factory,
+        };
         Ok(Self {
             base_url,
             auth_provider,
             http: RouteAwareClientPool::new_without_redirects_or_request_logging(
-                http_client_factory.without_dedicated_proxy(),
+                http_client_factory,
                 ClientRouteClass::Api,
             ),
             connect_timeout: DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT,
