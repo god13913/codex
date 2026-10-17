@@ -21,13 +21,15 @@ internal sealed class ConfiguratorBridge
         "saveProfile" => await UpdateUiAsync(ui => SaveProfile(ui, payload)),
         "removeProfile" => await UpdateUiAsync(ui => RemoveProfile(ui, payload.GetString() ?? "")),
         "chooseDesktop" => ChooseDesktop(),
+        "locateDesktop" => LocateDesktop(),
         "verifyDesktop" => VerifyDesktop(payload.GetString() ?? ""),
         "fetchNodes" => await FetchNodesAsync(payload.GetString() ?? ""),
         "importFile" => await ImportFileAsync(),
         "importClipboard" => ImportClipboard(),
         "exportProfile" => ExportProfile(payload),
         "applyProfile" => await RunExclusiveAsync(() => ApplyProfileAsync(payload)),
-        "disableProxy" => await RunExclusiveAsync(() => Task.FromResult(DisableProxy())),
+        "disableProxy" => await RunExclusiveAsync(DisableProxyAsync),
+        "uninstallProxy" => await RunExclusiveAsync(UninstallProxyAsync),
         "getNodeExitIpv4" => await GetNodeExitIpv4Async(payload),
         _ => throw new InvalidOperationException("不支持的界面操作。")
     };
@@ -79,9 +81,7 @@ internal sealed class ConfiguratorBridge
             var managedCli = IsManagedCliSelected();
             settings["enabled"] = enabled && managedCli;
             settings["cliPathMismatch"] = enabled && !managedCli;
-            if (string.IsNullOrWhiteSpace(settings["desktopPath"]?.GetValue<string>()) &&
-                settings["autoLocate"]?.GetValue<bool>() != false && DesktopLocator.Find() is { } desktop)
-                settings["desktopPath"] = desktop;
+            settings["installationMode"] = RuntimeModeInstaller.CurrentMode();
             return new { settings, profiles };
         }
         finally { storeGate.Release(); }
@@ -139,7 +139,7 @@ internal sealed class ConfiguratorBridge
                     ["port"] = vps.GetProperty("port").GetInt32(),
                     ["uuid"] = vps.GetProperty("uuid").GetString(),
                     ["tls"] = true, ["servername"] = host, ["network"] = "ws",
-                    ["client-fingerprint"] = "chrome", ["udp"] = false,
+                    ["client-fingerprint"] = "chrome", ["udp"] = true,
                     ["ws-opts"] = new Dictionary<string, object?>
                     {
                         ["path"] = vps.GetProperty("path").GetString(),
@@ -190,6 +190,14 @@ internal sealed class ConfiguratorBridge
         return dialog.FileName;
     }
 
+    private static string? LocateDesktop()
+    {
+        var desktop = DesktopLocator.Find();
+        if (desktop is null) return null;
+        DesktopLocator.Verify(desktop);
+        return desktop;
+    }
+
     private static bool VerifyDesktop(string path)
     {
         DesktopLocator.Verify(path);
@@ -210,7 +218,7 @@ internal sealed class ConfiguratorBridge
         using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
         client.DefaultRequestHeaders.UserAgent.ParseAdd("mihomo/1.19.32 CodexProxySetup/1.0");
         using var response = await client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
-        if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"订阅服务器返回 HTTP {(int)response.StatusCode}。");
+        if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"订阅服务器出错了（错误码 {(int)response.StatusCode}）。");
         if (response.Content.Headers.ContentLength > 4 * 1024 * 1024) throw new InvalidOperationException("订阅文件超过 4 MB。");
         await using var stream = await response.Content.ReadAsStreamAsync();
         using var data = new MemoryStream();
@@ -281,7 +289,7 @@ internal sealed class ConfiguratorBridge
         var dataManual = new Dictionary<string, object?>
         {
             ["name"] = name, ["type"] = kind, ["server"] = server, ["port"] = port,
-            ["network"] = ws ? "ws" : "tcp", ["udp"] = false,
+            ["network"] = ws ? "ws" : "tcp", ["udp"] = true,
             [kind is "vless" or "vmess" ? "uuid" : "password"] = Get(profile, "credential")
         };
         if (kind == "ss") dataManual["cipher"] = Get(profile, "cipher");
@@ -311,52 +319,24 @@ internal sealed class ConfiguratorBridge
     {
         var profile = payload.GetProperty("profile");
         var desktop = Get(payload, "desktopPath");
-        DesktopLocator.Verify(desktop);
         var selected = SelectedNode(profile, out var sourceUrl);
-        var runtime = await RuntimeInstaller.InstallAsync(new Progress<string>(_ => { }));
-        RuntimeInstaller.RegisterDesktop(runtime, desktop);
-        var previous = Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.User);
-        using var old = PrivateStore.Read("configurator.json");
-        if (old is not null && old.RootElement.TryGetProperty("previous_cli_path", out var backup))
-            previous = backup.ValueKind == JsonValueKind.Null ? null : backup.GetString();
-        foreach (var name in new[] { "subscription.json", "subscription-cache.json", "vps-profile.json", "node-profile.json" })
-            PrivateStore.MigrateCredentialFile(name);
-        var mode = sourceUrl is null ? "node" : "subscription";
-        if (sourceUrl is not null)
-        {
-            PrivateStore.Write("subscription.json", new { Url = sourceUrl, SelectedNodeName = selected.Name.Length > 0 ? selected.Name : null, SelectedNodeId = selected.Id });
-            PrivateStore.Write("subscription-cache.json", new { Subscription = sourceUrl, Node = selected.Data });
-        }
-        else PrivateStore.Write("node-profile.json", selected.Data);
-        PrivateStore.Write("settings.json", new { Enabled = true, Mode = mode, UpdatedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(), LastError = (string?)null }, false);
-        PrivateStore.Write("configurator.json", new Dictionary<string, object?>
-        {
-            ["previous_cli_path"] = previous, ["runtime_directory"] = runtime,
-            ["desktop_executable"] = desktop, ["selected_node_name"] = selected.Label
-        });
-        var cli = Path.Combine(runtime, "codex.exe");
-        Environment.SetEnvironmentVariable("CODEX_CLI_PATH", cli, EnvironmentVariableTarget.User);
-        Environment.SetEnvironmentVariable("CODEX_CLI_PATH", cli, EnvironmentVariableTarget.Process);
-        if (Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.User) != cli)
-            throw new InvalidOperationException("无法保存 CLI 设置。");
-        BroadcastEnvironment();
-        return "已保存并启用；重新打开官方桌面后生效。";
+        var installationMode = Get(payload, "installationMode");
+        if (installationMode.Length == 0) installationMode = RuntimeModeInstaller.CurrentMode();
+        await ProxyConfiguration.ApplyAsync(selected, sourceUrl, desktop, installationMode, new Progress<string>(_ => { }));
+        return (installationMode == RuntimeModeInstaller.Service
+            ? "Windows 服务已就绪；请正常重新打开官方桌面。"
+            : "已启用「不安装服务」模式。请完全退出并重开桌面，启动时允许管理员授权提示。") + ManagedRuntime.Notice;
     }
 
-    private static object DisableProxy()
+    private static async Task<object> DisableProxyAsync()
     {
-        using var settings = PrivateStore.Read("settings.json");
-        if (settings is not null)
-        {
-            var mode = settings.RootElement.GetProperty("mode").GetString();
-            PrivateStore.Write("settings.json", new { Enabled = false, Mode = mode, UpdatedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(), LastError = (string?)null }, false);
-        }
-        // Clear unconditionally, even when settings.json is absent: a leftover override would
-        // otherwise keep the desktop on the dedicated CLI while the UI reports it as disabled.
-        // Removing the CODEX_CLI_PATH override is what makes the desktop fall back to the
-        // official CLI - see RuntimeInstaller.ClearCliOverride for why we no longer restore a
-        // remembered path or gate this on the recorded runtime directory.
-        RuntimeInstaller.ClearCliOverride();
+        await RuntimeModeInstaller.DisableAsync();
+        return true;
+    }
+
+    private static async Task<object> UninstallProxyAsync()
+    {
+        await RuntimeModeInstaller.UninstallAsync();
         return true;
     }
 

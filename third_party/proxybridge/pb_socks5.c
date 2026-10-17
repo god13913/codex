@@ -243,30 +243,47 @@ int socks5_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, cons
     return 0;
 }
 
+static int socks5_udp_io(SOCKET s, char *data, int length, BOOL sending, ULONGLONG deadline)
+{
+    int transferred = 0;
+    while (transferred < length) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) return SOCKET_ERROR;
+        DWORD remaining = (DWORD)(deadline - now);
+        if (setsockopt(s, SOL_SOCKET, sending ? SO_SNDTIMEO : SO_RCVTIMEO,
+            (char *)&remaining, sizeof(remaining)) == SOCKET_ERROR) return SOCKET_ERROR;
+        int count = sending ? send(s, data + transferred, length - transferred, 0) :
+            recv(s, data + transferred, length - transferred, 0);
+        if (count <= 0) return SOCKET_ERROR;
+        transferred += count;
+    }
+    return transferred;
+}
+
 int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, const PROXY_CONFIG *cfg)
 {
     unsigned char buf[SOCKS5_BUFFER_SIZE];
     int len;
     BOOL use_auth = (cfg != NULL && cfg->username[0] != '\0');
+    ULONGLONG deadline = GetTickCount64() + 1500;
 
     buf[0] = SOCKS5_VERSION;
     if (use_auth)
     {
-        buf[1] = 0x02;
-        buf[2] = SOCKS5_AUTH_NONE;
-        buf[3] = 0x02;
-        if (send(s, (char*)buf, 4, 0) != 4)
+        buf[1] = 0x01;
+        buf[2] = 0x02; // Configured credentials must actually be authenticated.
+        if (socks5_udp_io(s, (char*)buf, 3, TRUE, deadline) != 3)
             return -1;
     }
     else
     {
         buf[1] = 0x01;
         buf[2] = SOCKS5_AUTH_NONE;
-        if (send(s, (char*)buf, 3, 0) != 3)
+        if (socks5_udp_io(s, (char*)buf, 3, TRUE, deadline) != 3)
             return -1;
     }
 
-    len = recv_n(s, (char*)buf, 2);
+    len = socks5_udp_io(s, (char*)buf, 2, FALSE, deadline);
     if (len != 2 || buf[0] != SOCKS5_VERSION)
         return -1;
 
@@ -286,14 +303,14 @@ int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, c
         buf[2 + user_len] = (unsigned char)pass_len;
         memcpy(&buf[3 + user_len], cfg->password, pass_len);
 
-        if (send(s, (char*)buf, (int)(3 + user_len + pass_len), 0) != (int)(3 + user_len + pass_len))
+        if (socks5_udp_io(s, (char*)buf, (int)(3 + user_len + pass_len), TRUE, deadline) != (int)(3 + user_len + pass_len))
             return -1;
 
-        len = recv_n(s, (char*)buf, 2);
+        len = socks5_udp_io(s, (char*)buf, 2, FALSE, deadline);
         if (len != 2 || buf[0] != 0x01 || buf[1] != 0x00)
             return -1;
     }
-    else if (buf[1] != SOCKS5_AUTH_NONE)
+    else if (use_auth || buf[1] != SOCKS5_AUTH_NONE)
     {
         return -1;
     }
@@ -309,7 +326,7 @@ int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, c
     buf[8] = 0;
     buf[9] = 0;
 
-    if (send(s, (char*)buf, 10, 0) != 10)
+    if (socks5_udp_io(s, (char*)buf, 10, TRUE, deadline) != 10)
         return -1;
 
     // Reply: VER REP RSV ATYP BND.ADDR BND.PORT. The proxy picks the BND.ADDR type
@@ -317,12 +334,13 @@ int socks5_udp_associate_with_config(SOCKET s, struct sockaddr_in *relay_addr, c
     // the 4-byte header first, then the bound endpoint by ATYP. We relay UDP over IPv4,
     // so an IPv4 bound endpoint is required (0.0.0.0 is handled by the caller).
     unsigned char rep[4];
-    if (recv_n(s, (char*)rep, 4) != 4 || rep[0] != SOCKS5_VERSION || rep[1] != 0x00)
+    if (socks5_udp_io(s, (char*)rep, 4, FALSE, deadline) != 4 ||
+        rep[0] != SOCKS5_VERSION || rep[1] != 0x00 || rep[2] != 0x00)
         return -1;
     if (rep[3] != SOCKS5_ATYP_IPV4)
         return -1;   // non-IPv4 relay endpoint can't be used by the IPv4 UDP send socket
     unsigned char ap[6];
-    if (recv_n(s, (char*)ap, 6) != 6)
+    if (socks5_udp_io(s, (char*)ap, 6, FALSE, deadline) != 6)
         return -1;
 
     relay_addr->sin_family = AF_INET;

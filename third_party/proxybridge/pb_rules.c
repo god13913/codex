@@ -25,6 +25,10 @@ RuleAction check_process_rule_v6(const UINT8 src_ip6[16], UINT16 src_port, const
 
     pid = is_udp ? get_process_id_from_udp_connection_v6(src_ip6, src_port)
                  : get_process_id_from_connection_v6(src_ip6, src_port);
+    for (int attempt = 0; pid == 0 && !is_udp && attempt < 3; ++attempt) {
+        Sleep(1);
+        pid = get_process_id_from_connection_v6(src_ip6, src_port);
+    }
     if (out_pid) *out_pid = pid;
     if (pid == 0) return RULE_ACTION_DIRECT;
     if (pid == g_current_process_id) return RULE_ACTION_DIRECT;
@@ -38,9 +42,9 @@ RuleAction check_process_rule_v6(const UINT8 src_ip6[16], UINT16 src_port, const
     {
         PROXY_CONFIG *cfg = find_proxy_config(proxy_config_id);
         if (cfg == NULL || cfg->host[0] == '\0' || cfg->port == 0)
-            return RULE_ACTION_DIRECT;
+            return RULE_ACTION_BLOCK;
         if (is_udp && cfg->type == PROXY_TYPE_HTTP)
-            return RULE_ACTION_DIRECT;
+            return RULE_ACTION_BLOCK;
     }
     if (out_proxy_config_id) *out_proxy_config_id = proxy_config_id;
     return action;
@@ -717,6 +721,10 @@ RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UI
     char process_name[MAX_PROCESS_NAME];
 
     pid = is_udp ? get_process_id_from_udp_connection(src_ip, src_port) : get_process_id_from_connection(src_ip, src_port);
+    for (int attempt = 0; pid == 0 && !is_udp && attempt < 3; ++attempt) {
+        Sleep(1);
+        pid = get_process_id_from_connection(src_ip, src_port);
+    }
     if (pid == 0 && is_udp)
         pid = get_process_id_from_connection(src_ip, src_port);
 
@@ -743,11 +751,11 @@ RuleAction check_process_rule(UINT32 src_ip, UINT16 src_port, UINT32 dest_ip, UI
     {
         PROXY_CONFIG *cfg = find_proxy_config(proxy_config_id);
         if (cfg == NULL || cfg->host[0] == '\0' || cfg->port == 0)
-            return RULE_ACTION_DIRECT;  // No proxy configured
+            return RULE_ACTION_BLOCK;  // Matched proxy failures must not turn into DIRECT.
 
         // UDP: HTTP proxy doesn't support UDP - use per-rule proxy config type
         if (is_udp && cfg->type == PROXY_TYPE_HTTP)
-            return RULE_ACTION_DIRECT;
+            return RULE_ACTION_BLOCK;
     }
 
     if (out_proxy_config_id != NULL)

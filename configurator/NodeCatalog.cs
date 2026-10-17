@@ -70,7 +70,7 @@ internal static class NodeCatalog
         {
             try { Validate(node); supported.Add(new NodeItem(node)); } catch (InvalidOperationException) { }
         }
-        if (supported.Count == 0) throw new InvalidOperationException("没有找到可用节点。请提供包含 proxies 的 Clash 配置或受支持的节点分享链接。");
+        if (supported.Count == 0) throw new InvalidOperationException("没有找到可用节点。请导入 Clash 配置文件或节点分享链接。");
         return supported;
     }
 
@@ -105,7 +105,9 @@ internal static class NodeCatalog
                 throw new InvalidOperationException("Reality Short ID 格式不正确。");
         }
         foreach (var field in new[] { "dialer-proxy", "interface-name", "routing-mark" }) node.Remove(field);
-        node["udp"] = false;
+        // Normalize legacy caches too: earlier versions wrote udp=false on
+        // every import. Try UDP through capable nodes; HTTP remains TCP only.
+        node["udp"] = type != "http";
     }
 
     private static object? Normalize(object? value, int depth = 0)

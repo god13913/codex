@@ -12,10 +12,12 @@ internal sealed class MainForm : Form
     private readonly ComboBox nodes = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     private readonly Label status = new() { AutoSize = true, ForeColor = Color.FromArgb(74, 85, 104), Text = "添加订阅或节点，然后选择一个节点保存。" };
     private readonly Label count = new() { AutoSize = true, Text = "尚未添加节点" };
-    private readonly Label desktopLabel = new() { AutoSize = true, Text = "正在查找官方桌面…" };
+    private readonly Label desktopLabel = new() { AutoSize = true, Text = "尚未定位官方桌面，请点击“自动定位”或选择文件。" };
+    private readonly ProgressBar operationProgress = new() { Width = 190, Height = 22, Style = ProgressBarStyle.Marquee, MarqueeAnimationSpeed = 24, Visible = false, Margin = new Padding(16, 0, 0, 0) };
     private readonly ComboBox protocol = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     private readonly Dictionary<string, TextBox> fields = new();
     private readonly NumericUpDown port = new() { Minimum = 1, Maximum = 65535, Value = 443, Dock = DockStyle.Fill };
+    private readonly ComboBox installationMode = new() { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
     private readonly List<Button> actions = new();
     private string? sourceUrl;
     private string? desktop;
@@ -28,19 +30,20 @@ internal sealed class MainForm : Form
         Font = new Font("Microsoft YaHei UI", 10F);
         BackColor = Color.FromArgb(245, 247, 251);
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(880, 730);
-        MinimumSize = new Size(820, 740);
+        ClientSize = new Size(940, 800);
+        MinimumSize = new Size(940, 820);
         AutoScaleMode = AutoScaleMode.Dpi;
-        var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(24), RowCount = 6, ColumnCount = 1 };
+        var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(24), RowCount = 7, ColumnCount = 1 };
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 54));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
         Controls.Add(root);
         var header = new Panel { Dock = DockStyle.Fill };
-        header.Controls.Add(new Label { Text = "配置一次，直接打开官方桌面", Font = new Font(Font.FontFamily, 18F, FontStyle.Bold), AutoSize = true, Location = new Point(0, 2), ForeColor = Color.FromArgb(24, 35, 56) });
+        header.Controls.Add(new Label { Text = "选择一个节点作为出口", Font = new Font(Font.FontFamily, 18F, FontStyle.Bold), AutoSize = true, Location = new Point(0, 2), ForeColor = Color.FromArgb(24, 35, 56) });
         header.Controls.Add(new Label { Text = "使用自己的订阅或节点 · 只选择一个出口 · 凭据按当前 Windows 用户加密保存", AutoSize = true, Location = new Point(1, 43), ForeColor = Color.FromArgb(91, 105, 126) });
         root.Controls.Add(header, 0, 0);
         var tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(18, 8) };
@@ -55,23 +58,33 @@ internal sealed class MainForm : Form
         selection.Controls.Add(nodes, 0, 1);
         selection.Controls.Add(count, 0, 2);
         root.Controls.Add(selection, 0, 2);
+        installationMode.Items.AddRange(new object[] { "1. 安装 Windows 后台服务（推荐，桌面启动前就绪）", "2. 不安装服务（桌面启动转发，含 UDP）" });
+        installationMode.SelectedIndex = RuntimeModeInstaller.CurrentMode() == RuntimeModeInstaller.Service ? 0 : 1;
+        var modePanel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1 };
+        modePanel.Controls.Add(installationMode, 0, 0);
+        modePanel.Controls.Add(new Label { AutoSize = true, Text = "切换服务前请先退出桌面；不安装服务时启动需要管理员授权。" }, 0, 1);
+        root.Controls.Add(modePanel, 0, 3);
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(0, 8, 0, 0), WrapContents = false };
         var save = Button("保存并一键配置", async () => await ApplyAsync(), 172);
         save.BackColor = accent; save.ForeColor = Color.White; save.FlatAppearance.BorderSize = 0;
         buttons.Controls.Add(save);
         buttons.Controls.Add(Button("打开官方桌面", async () => { await OpenDesktopAsync(); }, 148));
+        buttons.Controls.Add(Button("自动定位", async () => { LocateDesktop(); await Task.CompletedTask; }, 112));
         buttons.Controls.Add(Button("选择桌面文件", async () => { ChooseDesktop(); await Task.CompletedTask; }, 148));
-        buttons.Controls.Add(Button("停用专属代理", async () => { Disable(); await Task.CompletedTask; }, 148));
-        root.Controls.Add(buttons, 0, 3);
+        buttons.Controls.Add(Button("停用专属代理", async () => await DisableAsync(), 148));
+        root.Controls.Add(buttons, 0, 4);
+        var statusRow = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, AutoSize = false };
+        statusRow.Controls.Add(status);
+        statusRow.Controls.Add(operationProgress);
         var messages = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 2, ColumnCount = 1 };
-        messages.Controls.Add(status, 0, 0); messages.Controls.Add(desktopLabel, 0, 1);
-        root.Controls.Add(messages, 0, 4);
+        messages.Controls.Add(statusRow, 0, 0); messages.Controls.Add(desktopLabel, 0, 1);
+        root.Controls.Add(messages, 0, 5);
         var footer = new FlowLayoutPanel { Dock = DockStyle.Fill };
         var licenses = new LinkLabel { Text = "许可与源码", AutoSize = true, Margin = new Padding(0, 5, 24, 0) };
         licenses.LinkClicked += (_, _) => ShowLicenses();
         footer.Controls.Add(licenses);
-        footer.Controls.Add(new Label { Text = "桌面升级后请重新保存配置；转发时请允许管理员提示。", AutoSize = true, ForeColor = Color.FromArgb(91, 105, 126), Margin = new Padding(0, 5, 0, 0) });
-        root.Controls.Add(footer, 0, 5);
+        footer.Controls.Add(new Label { Text = "桌面升级后请重新保存一次配置；启动时请点击允许管理员授权。", AutoSize = true, ForeColor = Color.FromArgb(91, 105, 126), Margin = new Padding(0, 5, 0, 0) });
+        root.Controls.Add(footer, 0, 6);
         Shown += (_, _) => LoadExisting();
         FormClosing += (_, e) => { if (busy) { e.Cancel = true; SetStatus("操作进行中，请等待完成。", false); } };
     }
@@ -79,7 +92,7 @@ internal sealed class MainForm : Form
     private TabPage BuildSubscriptionTab()
     {
         var page = new TabPage("Clash 订阅") { BackColor = Color.White, Padding = new Padding(18) };
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 6, ColumnCount = 1 };
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 7, ColumnCount = 1 };
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 31));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 35));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 31));
@@ -96,7 +109,7 @@ internal sealed class MainForm : Form
         controls.Controls.Add(Button("导入 Clash 文件", ImportFileAsync, 148));
         controls.Controls.Add(Button("导入剪贴板节点", ImportClipboardAsync, 164));
         layout.Controls.Add(controls, 0, 3);
-        layout.Controls.Add(new Label { Text = "订阅有多个节点时，请在下方选择一个。以后自动刷新会继续使用所选节点。\r\n选定节点消失时保留有效缓存，重新打开配置器可改选。文件和剪贴板导入作为固定节点保存。", AutoSize = true, MaximumSize = new Size(760, 0), ForeColor = Color.FromArgb(91, 105, 126) }, 0, 4);
+        layout.Controls.Add(new Label { Text = "订阅里有多个节点时，请在下方选一个。以后自动刷新会继续用你选的这个；文件和剪贴板导入的节点会固定保存。", AutoSize = true, MaximumSize = new Size(760, 0), ForeColor = Color.FromArgb(91, 105, 126) }, 0, 4);
         layout.Controls.Add(new Label { Text = "支持 Clash YAML，以及常见节点分享订阅。每个人都使用自己的链接和凭据。", AutoSize = true, ForeColor = Color.FromArgb(91, 105, 126) }, 0, 5);
         page.Controls.Add(layout);
         return page;
@@ -157,14 +170,14 @@ internal sealed class MainForm : Form
             if (busy) return;
             try { await action(); }
             catch (InvalidOperationException error) { SetStatus(error.Message, true); }
-            catch { SetStatus("操作失败。请检查网络、文件访问权限和官方桌面是否已安装。", true); }
+            catch { SetStatus("操作失败。请检查网络、文件权限，并确认官方桌面已安装。", true); }
         };
         actions.Add(button); return button;
     }
     private void SetStatus(string text, bool error)
     { status.Text = text; status.ForeColor = error ? Color.FromArgb(176, 44, 44) : Color.FromArgb(47, 93, 72); }
     private void SetBusy(bool value)
-    { busy = value; foreach (var action in actions) action.Enabled = !value; nodes.Enabled = !value; UseWaitCursor = value; }
+    { busy = value; operationProgress.Visible = value; foreach (var action in actions) action.Enabled = !value; nodes.Enabled = !value; installationMode.Enabled = !value; UseWaitCursor = value; }
     private void UpdateManualFields()
     {
         var ws = protocol.SelectedIndex is 1 or 2 or 5;
@@ -200,7 +213,7 @@ internal sealed class MainForm : Form
             using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
             client.DefaultRequestHeaders.UserAgent.ParseAdd("mihomo/1.19.32 CodexProxySetup/1.0");
             using var response = await client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead);
-            if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"订阅服务器返回 HTTP {(int)response.StatusCode}。请检查链接或导入 Clash 文件。");
+            if (!response.IsSuccessStatusCode) throw new InvalidOperationException($"订阅服务器出错了（错误码 {(int)response.StatusCode}）。请检查链接，或改导入 Clash 文件。");
             if (response.Content.Headers.ContentLength > 4 * 1024 * 1024) throw new InvalidOperationException("订阅超过 4 MB。");
             await using var stream = await response.Content.ReadAsStreamAsync();
             using var data = new MemoryStream(); var buffer = new byte[32768];
@@ -240,7 +253,7 @@ internal sealed class MainForm : Form
         var kind = selectedProtocol switch { 2 or 3 => "vless", 4 => "ss", 5 => "vmess", _ => "trojan" };
         var data = new Dictionary<string, object?>
         { ["name"] = Get("name"), ["type"] = kind, ["server"] = server, ["port"] = (int)port.Value,
-            ["network"] = selectedProtocol is 1 or 2 or 5 ? "ws" : "tcp", ["udp"] = false };
+            ["network"] = selectedProtocol is 1 or 2 or 5 ? "ws" : "tcp", ["udp"] = true };
         data[kind is "vless" or "vmess" ? "uuid" : "password"] = Get("credential");
         if (kind == "ss") data["cipher"] = Get("cipher");
         else { data["tls"] = true; data[kind is "vless" or "vmess" ? "servername" : "sni"] = sni; data["skip-cert-verify"] = false; }
@@ -259,35 +272,16 @@ internal sealed class MainForm : Form
         if (sourceUrl is not null && !string.Equals(sourceUrl, subscription.Text.Trim(), StringComparison.Ordinal))
             throw new InvalidOperationException("订阅链接已修改，请先点击“获取 / 刷新节点”，再选择一个节点保存。");
         var selected = Selected ?? throw new InvalidOperationException("请先添加配置并选择一个节点。");
-        desktop ??= DesktopLocator.Find();
-        if (desktop is null) throw new InvalidOperationException("没有找到官方桌面，请安装官方 Codex 桌面或点击“选择桌面文件”。");
+        if (desktop is null) throw new InvalidOperationException("没有找到官方桌面，请点击“自动定位”或选择桌面文件。");
         DesktopLocator.Verify(desktop);
         SetBusy(true);
         try
         {
-            var runtime = await RuntimeInstaller.InstallAsync(new Progress<string>(message => SetStatus(message, false)));
-            RuntimeInstaller.RegisterDesktop(runtime, desktop);
-            var previous = Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.User);
-            using var old = PrivateStore.Read("configurator.json");
-            if (old is not null && old.RootElement.TryGetProperty("previous_cli_path", out var backup)) previous = backup.ValueKind == JsonValueKind.Null ? null : backup.GetString();
-            // Re-save earlier credential files as current-user DPAPI, preserving their content.
-            foreach (var name in new[] { "subscription.json", "subscription-cache.json", "vps-profile.json", "node-profile.json" })
-                PrivateStore.MigrateCredentialFile(name);
-            var mode = sourceUrl is null ? "node" : "subscription";
-            if (sourceUrl is not null)
-            {
-                PrivateStore.Write("subscription.json", new { Url = sourceUrl, SelectedNodeName = selected.Name.Length > 0 ? selected.Name : null, SelectedNodeId = selected.Id });
-                PrivateStore.Write("subscription-cache.json", new { Subscription = sourceUrl, Node = selected.Data });
-            }
-            else PrivateStore.Write("node-profile.json", selected.Data);
-            PrivateStore.Write("settings.json", new { Enabled = true, Mode = mode, UpdatedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(), LastError = (string?)null }, false);
-            PrivateStore.Write("configurator.json", new Dictionary<string, object?> { ["previous_cli_path"] = previous, ["runtime_directory"] = runtime, ["desktop_executable"] = desktop, ["selected_node_name"] = selected.Label });
-            var cli = Path.Combine(runtime, "codex.exe");
-            Environment.SetEnvironmentVariable("CODEX_CLI_PATH", cli, EnvironmentVariableTarget.User);
-            Environment.SetEnvironmentVariable("CODEX_CLI_PATH", cli, EnvironmentVariableTarget.Process);
-            if (Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.User) != cli) throw new InvalidOperationException("无法保存 CLI 设置。");
-            BroadcastEnvironment();
-            SetStatus($"已保存并启用：{selected.Label}。完全退出后重新打开官方桌面即可。", false);
+            var service = installationMode.SelectedIndex == 0;
+            await ProxyConfiguration.ApplyAsync(selected, sourceUrl, desktop,
+                service ? RuntimeModeInstaller.Service : RuntimeModeInstaller.Desktop,
+                new Progress<string>(message => SetStatus(message, false)));
+            SetStatus((service ? "Windows 服务已就绪，请正常重新打开官方桌面。" : "已按「不安装服务」方式配置。重开桌面时请点击允许管理员授权提示。") + ManagedRuntime.Notice, false);
             desktopLabel.Text = "官方桌面已登记；订阅与节点凭据已加密保存。";
         }
         finally { SetBusy(false); }
@@ -297,8 +291,6 @@ internal sealed class MainForm : Form
     {
         try
         {
-            desktop = DesktopLocator.Find();
-            desktopLabel.Text = desktop is null ? "未找到官方桌面，可点击“选择桌面文件”。" : "已找到官方桌面。";
             using var settings = PrivateStore.Read("settings.json");
             if (settings is null) return;
             var mode = settings.RootElement.GetProperty("mode").GetString();
@@ -322,7 +314,21 @@ internal sealed class MainForm : Form
             }
             if (Selected is { } selected) SetStatus("已保存的节点：" + selected.Label, false);
         }
-        catch { SetStatus("已有配置无法读取。可以输入自己的订阅或节点重新配置。", true); }
+        catch { SetStatus("已有配置无法读取，请重新配置。", true); }
+    }
+    private void LocateDesktop()
+    {
+        var found = DesktopLocator.Find();
+        if (found is null)
+        {
+            desktop = null;
+            desktopLabel.Text = "未找到官方桌面，请安装后重试或选择文件。";
+            throw new InvalidOperationException("没有找到官方桌面，请先安装官方 Codex 桌面，或点击「选择桌面文件」手动指定。");
+        }
+        DesktopLocator.Verify(found);
+        desktop = found;
+        desktopLabel.Text = "已找到有效签名的官方桌面。";
+        SetStatus("自动定位完成。", false);
     }
     private void ChooseDesktop()
     {
@@ -333,31 +339,24 @@ internal sealed class MainForm : Form
     }
     private Task OpenDesktopAsync()
     {
-        desktop = DesktopLocator.Find() ?? desktop;
         if (desktop is null) throw new InvalidOperationException("请先安装或选择官方桌面。");
         DesktopLocator.Verify(desktop);
         using var meta = PrivateStore.Read("configurator.json");
-        if (meta is not null && meta.RootElement.TryGetProperty("runtime_directory", out var runtime))
+        if (RuntimeModeInstaller.CurrentMode() == RuntimeModeInstaller.Desktop && meta is not null && meta.RootElement.TryGetProperty("runtime_directory", out var runtime))
             RuntimeInstaller.RegisterDesktop(runtime.GetString()!, desktop);
         RuntimeInstaller.LaunchDesktop(desktop);
-        SetStatus("已打开官方桌面。若桌面此前已运行，请完全退出后重开使配置生效。", false);
+        SetStatus("已打开官方桌面。如果它之前就在运行，请完全退出后重开，配置才会生效。", false);
         return Task.CompletedTask;
     }
-    private void Disable()
+    private async Task DisableAsync()
     {
-        using var settings = PrivateStore.Read("settings.json");
-        if (settings is not null)
+        SetBusy(true);
+        try
         {
-            var mode = settings.RootElement.GetProperty("mode").GetString();
-            PrivateStore.Write("settings.json", new { Enabled = false, Mode = mode, UpdatedAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds(), LastError = (string?)null }, false);
+            await RuntimeModeInstaller.DisableAsync();
+            SetStatus("已停用代理并恢复官方版。请完全退出桌面后重新打开；旧文件已保留，不影响使用。", false);
         }
-        // Clear unconditionally, even when settings.json is absent: a leftover override would
-        // otherwise keep the desktop on the dedicated CLI while the UI reports it as disabled.
-        // Removing the CODEX_CLI_PATH override is what makes the desktop fall back to the
-        // official CLI - see RuntimeInstaller.ClearCliOverride for why we no longer restore a
-        // remembered path or gate this on the recorded runtime directory.
-        RuntimeInstaller.ClearCliOverride();
-        SetStatus("已停用，官方桌面将使用自带的官方 CLI。完全退出后重新打开桌面生效。", false);
+        finally { SetBusy(false); }
     }
 
     private void ShowLicenses()

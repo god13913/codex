@@ -1,6 +1,7 @@
 //! Private subscription transport for Codex service requests. No global proxy environment changes.
 #[cfg(windows)]
 mod desktop;
+mod dns_forwarder;
 mod storage;
 mod windows;
 
@@ -11,6 +12,7 @@ use std::io::{IsTerminal, Read};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -18,6 +20,18 @@ const CORE_VERSION: &str = "1.19.32";
 const CORE_SHA256: &str = "3C107D54EF1B895E4980B53F517D52F3C1137101FA2637347C9CE343FC50D7B2";
 static ACTIVE: Mutex<Option<Weak<Runtime>>> = Mutex::new(None);
 static START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static SERVICE: Mutex<Option<Weak<ServiceRuntime>>> = Mutex::new(None);
+static SERVICE_START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub struct ServiceProxyGuard {
+    _runtime: Arc<ServiceRuntime>,
+}
+
+struct ServiceRuntime {
+    home: PathBuf,
+    proxy_url: String,
+    _owned: Option<ProxyGuard>,
+}
 
 pub struct ProxyGuard(Arc<Runtime>);
 struct Runtime {
@@ -27,6 +41,14 @@ struct Runtime {
     controller_secret: String,
     proxy_port: u16,
     password: String,
+    dns_nameservers: Vec<String>,
+    dns_bootstrap: Vec<String>,
+    /// Loopback resolver that reaches DoH through this kernel, if one could be started.
+    dns_resolver: Option<String>,
+    /// Consecutive failures of that resolver, shared with the running task.
+    dns_resolver_failures: Arc<AtomicUsize>,
+    /// Kept only so the resolver task lives as long as the runtime.
+    _resolver: Option<dns_forwarder::Forwarder>,
     child: Mutex<Child>,
     #[cfg(windows)]
     bridge: Mutex<Option<desktop::BridgeLease>>,
@@ -50,16 +72,140 @@ impl Drop for Runtime {
 }
 
 pub fn active_proxy_url() -> Option<String> {
-    ACTIVE
+    let owned = ACTIVE
         .lock()
         .ok()?
-        .as_ref()?
-        .upgrade()
-        .map(|runtime| runtime.proxy_url.clone())
+        .as_ref()
+        .and_then(Weak::upgrade)
+        .map(|runtime| runtime.proxy_url.clone());
+    owned.or_else(|| {
+        SERVICE
+            .lock()
+            .ok()?
+            .as_ref()?
+            .upgrade()
+            .map(|runtime| runtime.proxy_url.clone())
+    })
+}
+
+/// Own a private kernel, or authenticate the sibling kernel using this home's endpoint.
+/// A service entry point retains this lease for its entire network lifetime.
+pub async fn start_service_if_enabled(home: &Path) -> Result<Option<ServiceProxyGuard>> {
+    let _start = SERVICE_START.lock().await;
+    let settings = storage::settings(home)?;
+    if !settings.enabled {
+        return Ok(None);
+    }
+    if let Some(existing) = SERVICE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("service proxy lock failed"))?
+        .as_ref()
+        .and_then(Weak::upgrade)
+    {
+        if existing.home != home {
+            bail!("a service proxy for another CODEX_HOME is already active");
+        }
+        return Ok(Some(ServiceProxyGuard { _runtime: existing }));
+    }
+    let port = storage::effective_proxy_port(&settings);
+    let endpoint = storage::endpoint_for(&settings).context("missing service proxy endpoint")?;
+    #[cfg(windows)]
+    let persistent = if desktop::needs_owned_kernel()? {
+        desktop::persistent::ready_for_desktop(port).await?
+    } else { false };
+    #[cfg(not(windows))]
+    let persistent = false;
+    let owned = if persistent {
+        authenticate_service_endpoint(port, &storage::effective_proxy_password(&settings)).await?;
+        None
+    } else if active_proxy_url().is_some() {
+        start_if_enabled(home).await?
+    } else if std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(250),
+    )
+    .is_ok()
+    {
+        #[cfg(windows)]
+        if desktop::needs_owned_kernel()? {
+            bail!(
+                "the desktop forwarding worker needs its own private kernel; another process holds the configured port (use a separate port for standalone services)"
+            );
+        }
+        authenticate_service_endpoint(port, &storage::effective_proxy_password(&settings)).await?;
+        None
+    } else {
+        start_if_enabled(home).await?
+    };
+    let runtime = Arc::new(ServiceRuntime {
+        home: home.to_owned(),
+        proxy_url: endpoint,
+        _owned: owned,
+    });
+    *SERVICE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("service proxy lock failed"))? =
+        Some(Arc::downgrade(&runtime));
+    Ok(Some(ServiceProxyGuard { _runtime: runtime }))
+}
+
+async fn authenticate_service_endpoint(port: u16, password: &str) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // The mixed listener authenticates before any CONNECT/UDP ASSOCIATE command.
+    // Stop there: this proof is local and does not depend on upstream reachability.
+    let probe = async {
+        let mut stream =
+            tokio::net::TcpStream::connect(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+                .await?;
+        stream.write_all(&[5, 1, 2]).await?;
+        let mut reply = [0; 2];
+        stream.read_exact(&mut reply).await?;
+        if reply != [5, 2] {
+            bail!("dedicated mixed listener requires SOCKS5 authentication");
+        }
+        let mut auth = vec![1, 5];
+        auth.extend_from_slice(b"codex");
+        auth.push(u8::try_from(password.len()).context("invalid proxy authentication length")?);
+        auth.extend_from_slice(password.as_bytes());
+        let sent = stream.write_all(&auth).await;
+        auth.fill(0);
+        sent?;
+        stream.read_exact(&mut reply).await?;
+        if reply != [1, 0] {
+            bail!("dedicated proxy authentication was rejected");
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    tokio::time::timeout(Duration::from_secs(3), probe).await
+        .map_err(|_| anyhow::anyhow!("dedicated proxy authentication timed out"))?
+        .map_err(|_| anyhow::anyhow!("existing listener did not pass local dedicated proxy authentication (an updated mixed listener is required)"))
 }
 
 pub fn enabled(home: &Path) -> Result<bool> {
     Ok(storage::settings(home)?.enabled)
+}
+
+/// Fixed local endpoint for processes that should reuse the kernel another process
+/// already started, instead of starting a second one. Returns `None` when the
+/// dedicated proxy is disabled or its settings cannot be read.
+pub fn proxy_endpoint(home: &Path) -> Option<String> {
+    let settings = storage::settings(home).ok()?;
+    storage::endpoint_for(&settings)
+}
+
+/// Resolves CODEX_HOME the same way the diagnostic entrypoint does, so callers that
+/// do not already carry a home path can still find the endpoint.
+fn default_codex_home() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE").map(|value| PathBuf::from(value).join(".codex"))
+        })
+}
+
+/// Convenience wrapper around [`proxy_endpoint`] for standalone processes.
+pub fn configured_proxy_endpoint() -> Option<String> {
+    proxy_endpoint(&default_codex_home()?)
 }
 
 pub fn custom_distribution() -> bool {
@@ -106,24 +252,84 @@ fn private_client() -> Result<reqwest::Client> {
         .map_err(|_| anyhow::anyhow!("cannot create private kernel control client"))
 }
 
+/// Builds the kernel's `dns` section.
+///
+/// The kernel resolves a hostname locally before dialling the node, and a poisoned OS
+/// resolver makes every tunnel stall on a dead address until a retry re-resolves the name.
+/// The kernel cannot send DNS through a proxy, so instead it is pointed at a loopback
+/// resolver (see [`dns_forwarder`]) whose upstream DoH leaves through this very kernel -
+/// that is what puts the lookup on the far side of the node. An operator-supplied
+/// `dns_nameservers` list takes precedence when the forwarder could not start, and an
+/// explicitly empty list turns kernel-side resolution off altogether.
+///
+/// `proxy-server-nameserver` is what keeps that arrangement from deadlocking: the node's
+/// own host name must be resolved directly over plain domestic resolvers, because
+/// resolving it through the loopback resolver would require the very tunnel that requires
+/// the node's address first. Mihomo otherwise resolves the node host name with the
+/// default `nameserver`, which is exactly the loop observed in kernel logs
+/// (`dial CODEX: dns resolve failed` while every lookup queued behind the dead tunnel).
+fn dns_section(runtime: &Runtime) -> serde_json::Value {
+    // Stop pointing the kernel at the forwarder once it has failed repeatedly, so a dead
+    // resolver degrades to the operator's list instead of stalling every lookup.
+    let resolver = match runtime.dns_resolver.as_ref() {
+        Some(address)
+            if runtime.dns_resolver_failures.load(Ordering::Relaxed)
+                < dns_forwarder::FAILURE_LIMIT =>
+        {
+            Some(address.as_str())
+        }
+        _ => None,
+    };
+    dns_section_from(resolver, &runtime.dns_nameservers, &runtime.dns_bootstrap)
+}
+
+/// Pure form of [`dns_section`] so the invariants can be unit-tested without a live
+/// kernel runtime. `bootstrap` must be non-empty (guaranteed by
+/// [`storage::effective_dns_bootstrap`]).
+fn dns_section_from(
+    resolver: Option<&str>,
+    nameservers: &[String],
+    bootstrap: &[String],
+) -> serde_json::Value {
+    if resolver.is_none() && nameservers.is_empty() {
+        return json!({"enable": false});
+    }
+    let servers: Vec<String> = match resolver {
+        Some(address) => vec![format!("udp://{address}")],
+        None => nameservers.to_vec(),
+    };
+    // `default-nameserver` bootstraps operator-supplied DoH endpoints and is rejected by
+    // Mihomo when empty; `proxy-server-nameserver` pins the node's own host name to the
+    // same direct resolvers so it can never depend on the forwarder (see the doc comment
+    // on [`dns_section`]). Neither costs anything while the forwarder is in use.
+    json!({"enable": true, "ipv6": false, "prefer-h3": false, "use-hosts": true,
+        "default-nameserver": bootstrap,
+        "proxy-server-nameserver": bootstrap, "nameserver": servers})
+}
+
 fn configuration(runtime: &Runtime, node: &serde_yaml::Mapping) -> Result<String> {
     let node = serde_json::to_value(node)
         .map_err(|_| anyhow::anyhow!("cannot serialize validated node"))?;
     // JSON is accepted by Mihomo's YAML loader. Use its own serializer so dependency-level
     // serde_json/arbitrary_precision cannot turn numeric ports into private YAML mappings.
     serde_json::to_string(&json!({
-        "port": runtime.proxy_port, "socks-port": 0, "mixed-port": 0,
+        "port": 0, "socks-port": 0, "mixed-port": runtime.proxy_port,
         "redir-port": 0, "tproxy-port": 0, "allow-lan": false, "bind-address": "127.0.0.1",
         "mode": "rule", "log-level": "silent", "find-process-mode": "off",
         "authentication": if runtime.password.is_empty() { Vec::<String>::new() } else { vec![format!("codex:{}", runtime.password)] },
         "skip-auth-prefixes": [],
         "external-controller": runtime.controller, "secret": runtime.controller_secret,
-        "tun": {"enable": false}, "dns": {"enable": false},
+        "tun": {"enable": false},
+        "dns": dns_section(runtime),
         "sniffer": {"enable": true, "parse-pure-ip": true,
             "sniff": {"TLS": {"ports": [443], "override-destination": true},
-                "HTTP": {"ports": [80], "override-destination": true}}},
+                "HTTP": {"ports": [80], "override-destination": true},
+                "QUIC": {"ports": [443], "override-destination": true}}},
         "profile": {"store-selected": false, "store-fake-ip": false},
-        "proxies": [node], "rules": ["MATCH,CODEX"]
+        // Mihomo skips a matched adapter that cannot carry UDP, then defaults
+        // to DIRECT when no rule remains. Always terminate with REJECT so an
+        // unsupported UDP transport can only trigger application TCP fallback.
+        "proxies": [node], "rules": ["MATCH,CODEX", "MATCH,REJECT"]
     }))
     .map_err(|_| anyhow::anyhow!("cannot serialize private kernel configuration"))
 }
@@ -204,15 +410,45 @@ pub async fn start_if_enabled(home: &Path) -> Result<Option<ProxyGuard>> {
         .tempdir_in(&root)
         .context("cannot create private kernel runtime")?;
     windows::private_directory(runtime_dir.path())?;
-    // Reserve both ports simultaneously, then release immediately before starting the kernel.
-    let proxy_listener =
-        TcpListener::bind("127.0.0.1:0").context("cannot reserve private proxy port")?;
+    // Use the configured fixed proxy port so sibling processes (a standalone
+    // exec-server, for example) can reach this kernel instead of starting a second
+    // one. The control port stays ephemeral: only this process ever talks to it.
+    let proxy_port = storage::effective_proxy_port(&settings);
+    let proxy_listener = match TcpListener::bind(("127.0.0.1", proxy_port)) {
+        Ok(listener) => listener,
+        Err(_) => {
+            windows::alert_port_in_use(proxy_port);
+            bail!(
+                "dedicated proxy port {proxy_port} is already in use; close the program \
+                 holding it or change proxy_port in settings.json"
+            );
+        }
+    };
     let control_listener =
         TcpListener::bind("127.0.0.1:0").context("cannot reserve private control port")?;
-    let proxy_port = proxy_listener.local_addr()?.port();
     let controller = control_listener.local_addr()?.to_string();
     let secret = random_secret();
-    let password = random_secret();
+    let password = storage::effective_proxy_password(&settings);
+    // Start the loopback resolver before the kernel exists: it binds a port now and only
+    // needs the kernel once a query actually arrives. An explicitly empty `dns_nameservers`
+    // is the operator's opt-out from kernel-side resolution, forwarder included.
+    let kernel_dns = !storage::effective_dns_nameservers(&settings).is_empty();
+    let mut resolver = None;
+    let mut resolver_failures = Arc::new(AtomicUsize::new(0));
+    if kernel_dns {
+        match dns_forwarder::start(proxy_port, &password).await {
+            Ok(value) => {
+                resolver_failures = value.failures_counter();
+                resolver = Some(value);
+            }
+            Err(error) => {
+                // Degrade to the configured resolvers, but leave a trace: a silent failure
+                // here looks like "DNS is slow" and is otherwise impossible to diagnose.
+                settings.last_error = Some(format!("dedicated resolver unavailable: {error}"));
+                let _ = storage::save_settings(home, &settings);
+            }
+        }
+    }
     let bootstrap = serde_json::to_string(&json!({
         "port": 0, "socks-port": 0, "mixed-port": 0, "allow-lan": false,
         "bind-address": "127.0.0.1", "log-level": "silent", "mode": "rule", "find-process-mode": "off",
@@ -256,6 +492,11 @@ pub async fn start_if_enabled(home: &Path) -> Result<Option<ProxyGuard>> {
         controller_secret: secret,
         proxy_port,
         password,
+        dns_nameservers: storage::effective_dns_nameservers(&settings),
+        dns_bootstrap: storage::effective_dns_bootstrap(&settings),
+        dns_resolver: resolver.as_ref().map(|value| value.address().to_string()),
+        dns_resolver_failures: resolver_failures,
+        _resolver: resolver,
         child: Mutex::new(child),
         #[cfg(windows)]
         bridge: Mutex::new(None),
@@ -326,7 +567,7 @@ pub async fn start_if_enabled(home: &Path) -> Result<Option<ProxyGuard>> {
         .map_err(|_| anyhow::anyhow!("proxy runtime lock failed"))? =
         Some(Arc::downgrade(&runtime));
     #[cfg(windows)]
-    match desktop::attach(&runtime) {
+    match desktop::attach(&runtime).await {
         Ok(bridge) => {
             *runtime
                 .bridge
@@ -336,6 +577,7 @@ pub async fn start_if_enabled(home: &Path) -> Result<Option<ProxyGuard>> {
         Err(error) => {
             settings.last_error = Some(format!("desktop forwarding unavailable: {error}"));
             storage::save_settings(home, &settings)?;
+            return Err(error.context("desktop forwarding did not become ready"));
         }
     }
     if settings.mode == storage::Mode::Subscription {
@@ -358,7 +600,10 @@ fn refresh_in_background(runtime: Weak<Runtime>) {
                 let cache = storage::download_selected(&config, Some(&proxy)).await?;
                 let current = storage::subscription_config(&home)?;
                 let mut settings = storage::settings(&home)?;
-                if current != config || settings.mode != storage::Mode::Subscription || !settings.enabled {
+                if current != config
+                    || settings.mode != storage::Mode::Subscription
+                    || !settings.enabled
+                {
                     return Ok::<(), anyhow::Error>(());
                 }
                 if let Some(active) = runtime.upgrade() {
@@ -401,6 +646,16 @@ pub fn run_desktop_bridge(request: &Path) -> Result<()> {
         let _ = request;
         bail!("desktop forwarding requires Windows");
     }
+}
+
+pub fn run_persistent_service() -> Result<()> {
+    #[cfg(windows)] { desktop::persistent::run() }
+    #[cfg(not(windows))] { bail!("persistent forwarding requires Windows"); }
+}
+
+pub fn prepare_persistent_service(home: &Path) -> Result<()> {
+    #[cfg(windows)] { desktop::persistent::prepare(home) }
+    #[cfg(not(windows))] { let _ = home; bail!("persistent forwarding requires Windows"); }
 }
 
 pub fn run_desktop_bridge_session(request: &Path) -> Result<()> {
@@ -555,7 +810,9 @@ pub async fn manage(home: &Path, action: &str, from_stdin: bool) -> Result<serde
                 storage::Mode::Vps => {
                     storage::vps_profile(home)?;
                 }
-                storage::Mode::Node => { storage::node_profile(home)?; }
+                storage::Mode::Node => {
+                    storage::node_profile(home)?;
+                }
             }
             settings.enabled = true;
             storage::save_settings(home, &settings)?;
@@ -611,10 +868,102 @@ pub async fn manage(home: &Path, action: &str, from_stdin: bool) -> Result<serde
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn local_proxy_fixture(method: u8, status: u8) -> (u16, std::thread::JoinHandle<()>) {
+        use std::io::Write;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                // start_service also does a bare local TCP readiness check.
+                let mut greeting = [0; 3];
+                if stream.read(&mut greeting[..1]).unwrap() == 0 {
+                    continue;
+                }
+                stream.read_exact(&mut greeting[1..]).unwrap();
+                assert_eq!(greeting, [5, 1, 2]);
+                stream.write_all(&[5, method]).unwrap();
+                if method == 2 {
+                    let mut header = [0; 2];
+                    stream.read_exact(&mut header).unwrap();
+                    assert_eq!(header, [1, 5]);
+                    let mut user = [0; 5];
+                    stream.read_exact(&mut user).unwrap();
+                    assert_eq!(&user, b"codex");
+                    let mut length = [0];
+                    stream.read_exact(&mut length).unwrap();
+                    let mut password = vec![0; usize::from(length[0])];
+                    stream.read_exact(&mut password).unwrap();
+                    assert!(!password.is_empty());
+                    stream.write_all(&[1, status]).unwrap();
+                }
+                // The client must close without requesting any destination.
+                match stream.read(&mut greeting[..1]) {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    result => panic!("authentication probe sent a destination or did not close: {result:?}"),
+                }
+                break;
+            }
+        });
+        (port, worker)
+    }
+
+    #[tokio::test]
+    async fn service_lease_reuses_authenticated_listener_and_releases_endpoint() {
+        let (port, worker) = local_proxy_fixture(2, 0);
+        let home = tempfile::tempdir().unwrap();
+        storage::save_settings(
+            home.path(),
+            &storage::Settings {
+                enabled: true,
+                proxy_port: port,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let first = start_service_if_enabled(home.path())
+            .await
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+        let second = start_service_if_enabled(home.path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first._runtime, &second._runtime));
+        assert!(first._runtime._owned.is_none());
+        assert!(active_proxy_url().is_some());
+        drop(first);
+        assert!(active_proxy_url().is_some());
+        drop(second);
+        assert!(active_proxy_url().is_none());
+    }
+
+    #[tokio::test]
+    async fn service_probe_rejects_auth_failure_and_downgrade_without_remote_request() {
+        for (method, status) in [(2, 1), (0, 0), (255, 0)] {
+            let (port, worker) = local_proxy_fixture(method, status);
+            assert!(
+                authenticate_service_endpoint(port, "fixture-password")
+                    .await
+                    .is_err()
+            );
+            worker.join().unwrap();
+        }
+    }
     #[tokio::test]
     #[ignore = "requires the pinned core next to the test executable"]
     async fn real_kernel_lifecycle_authentication_and_failure() {
         let home = tempfile::tempdir().unwrap();
+        // Never contend with the user's live fixed listener during this fixture.
+        let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+        let fixture_port = reservation.local_addr().unwrap().port();
+        drop(reservation);
         let fixture = "proxies:\n- type: vless\n  server: example.invalid\n  port: 443\n  uuid: 00000000-0000-0000-0000-000000000001\n  tls: true\n  servername: example.invalid\n  reality-opts:\n    public-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n    short-id: ''\n";
         let cache = storage::Cache {
             subscription: "https://example.invalid/subscription".into(),
@@ -635,14 +984,25 @@ mod tests {
             &storage::Settings {
                 enabled: true,
                 mode: storage::Mode::Subscription,
+                proxy_port: fixture_port,
+                dns_nameservers: Some(vec![]),
                 updated_at: storage::now(),
                 last_error: None,
+                ..Default::default()
             },
         )
         .unwrap();
         let guard = start_if_enabled(home.path()).await.unwrap().unwrap();
         let port = guard.0.proxy_port;
         let control = guard.0.controller.clone();
+        let rules: serde_json::Value = private_client().unwrap()
+            .get(format!("http://{control}/rules"))
+            .bearer_auth(&guard.0.controller_secret)
+            .send().await.unwrap().json().await.unwrap();
+        let installed = rules["rules"].as_array().unwrap();
+        assert_eq!(installed.len(), 2);
+        assert_eq!(installed[0]["proxy"], "CODEX");
+        assert_eq!(installed[1]["proxy"], "REJECT");
         let startup =
             std::fs::read_to_string(guard.0._directory.path().join("bootstrap.yaml")).unwrap();
         assert!(!startup.contains("example.invalid"));
@@ -673,5 +1033,36 @@ mod tests {
         std::fs::write(dir.join("subscription.json"), "SECRET_NOT_JSON").unwrap();
         let error = storage::cache(home.path()).err().unwrap().to_string();
         assert!(!error.contains("SECRET"));
+    }
+
+    #[test]
+    fn dns_section_never_resolves_the_node_through_the_forwarder() {
+        let bootstrap = vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()];
+        // Forwarder running: only client names go through the loopback resolver ...
+        let value = dns_section_from(Some("127.0.0.1:52220"), &[], &bootstrap);
+        assert_eq!(value["enable"], json!(true));
+        assert_eq!(value["nameserver"][0], "udp://127.0.0.1:52220");
+        // ... while the node's own host name resolves directly: pointing it at the
+        // forwarder deadlocks on the tunnel that needs the node address first.
+        assert_eq!(
+            value["proxy-server-nameserver"],
+            json!(["223.5.5.5", "119.29.29.29"])
+        );
+        assert_eq!(
+            value["default-nameserver"],
+            json!(["223.5.5.5", "119.29.29.29"])
+        );
+        // A failed forwarder degrades to the operator's DoH list, same guarantees.
+        let value = dns_section_from(None, &["https://doh.pub/dns-query".to_string()], &bootstrap);
+        assert_eq!(value["nameserver"], json!(["https://doh.pub/dns-query"]));
+        assert_eq!(
+            value["proxy-server-nameserver"],
+            json!(["223.5.5.5", "119.29.29.29"])
+        );
+        // No resolver and no operator list disables kernel-side resolution entirely.
+        assert_eq!(
+            dns_section_from(None, &[], &bootstrap),
+            json!({"enable": false})
+        );
     }
 }

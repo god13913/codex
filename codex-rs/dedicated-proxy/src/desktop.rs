@@ -1,6 +1,9 @@
 //! Administrator packet forwarding for an unchanged, installed desktop executable.
 //! Credentials stay in the user's protected runtime directory, never in arguments.
 mod session;
+mod identity_acl;
+mod relay_firewall;
+pub(crate) mod persistent;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -24,9 +27,30 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::Shell::IsUserAnAdmin;
 
+const DEFAULT_DESKTOP_PACKAGE_FAMILY: &str = "OpenAI.Codex_2p2nqsd0c76g0";
+const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetPackagesByPackageFamily(
+        package_family_name: *const u16,
+        count: *mut u32,
+        package_full_names: *mut *mut u16,
+        buffer_length: *mut u32,
+        buffer: *mut u16,
+    ) -> i32;
+    fn GetPackagePathByFullName(
+        package_full_name: *const u16,
+        path_length: *mut u32,
+        path: *mut u16,
+    ) -> i32;
+}
+
 #[derive(Deserialize)]
 struct Distribution {
     schema: u32,
+    #[serde(default)]
+    desktop_package_family: Option<String>,
     desktop_executable: PathBuf,
     desktop_sha256: String,
     bridge_sha256: String,
@@ -90,11 +114,285 @@ fn distribution() -> Result<(PathBuf, Distribution)> {
         .parent()
         .context("missing CLI directory")?
         .to_owned();
-    let config: Distribution = read_json(&directory.join("desktop-forwarding.json"))?;
+    let mut config: Distribution = read_json(&directory.join("desktop-forwarding.json"))?;
     if config.schema != 1 {
         bail!("unsupported desktop bridge configuration");
     }
+    let family = config
+        .desktop_package_family
+        .as_deref()
+        .unwrap_or(DEFAULT_DESKTOP_PACKAGE_FAMILY);
+    if family != DEFAULT_DESKTOP_PACKAGE_FAMILY {
+        bail!("unsupported desktop package family");
+    }
+    // The official MSIX package changes its versioned install directory on every
+    // update. Keep the package family as the stable identity and resolve the
+    // current highest x64 package whenever a desktop identity is needed.
+    let current = resolve_desktop_executable(family, Some(&config.desktop_executable))?;
+    if !same_path(&current, &config.desktop_executable) {
+        config.desktop_sha256 = file_sha256(&current)?;
+    }
+    config.desktop_executable = current;
     Ok((directory, config))
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    Ok(format!("{:X}", Sha256::digest(std::fs::read(path)?)))
+}
+
+fn package_version(full_name: &str, family: &str) -> Option<[u64; 4]> {
+    let (package_name, publisher_id) = family.rsplit_once('_')?;
+    let prefix = format!("{package_name}_");
+    let remainder = full_name.strip_prefix(&prefix)?;
+    let mut fields = remainder.split('_');
+    let version = fields.next()?;
+    if fields.next()? != "x64" {
+        return None;
+    }
+    if fields.next()? != "" || !fields.next()?.eq_ignore_ascii_case(publisher_id) {
+        return None;
+    }
+    if fields.next().is_some() {
+        return None;
+    }
+    let mut result = [0u64; 4];
+    for (index, value) in version.split('.').enumerate() {
+        if index >= result.len() {
+            return None;
+        }
+        result[index] = value.parse().ok()?;
+    }
+    Some(result)
+}
+
+fn package_full_names(family: &str) -> Result<Vec<String>> {
+    let family_name = wide(family);
+    let mut count = 0;
+    let mut length = 0;
+    let first = unsafe {
+        GetPackagesByPackageFamily(
+            family_name.as_ptr(),
+            &mut count,
+            std::ptr::null_mut(),
+            &mut length,
+            std::ptr::null_mut(),
+        )
+    };
+    if first != ERROR_INSUFFICIENT_BUFFER || count == 0 || length == 0 {
+        bail!("official desktop package is not registered for this user");
+    }
+    let mut names = vec![std::ptr::null_mut(); count as usize];
+    let mut buffer = vec![0u16; length as usize];
+    let result = unsafe {
+        GetPackagesByPackageFamily(
+            family_name.as_ptr(),
+            &mut count,
+            names.as_mut_ptr(),
+            &mut length,
+            buffer.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        bail!("cannot enumerate official desktop packages");
+    }
+    Ok(names
+        .into_iter()
+        .filter_map(|pointer| {
+            if pointer.is_null() {
+                return None;
+            }
+            let mut length = 0usize;
+            while unsafe { *pointer.add(length) } != 0 {
+                length += 1;
+            }
+            Some(String::from_utf16_lossy(unsafe {
+                std::slice::from_raw_parts(pointer, length)
+            }))
+        })
+        .collect())
+}
+
+fn package_path(full_name: &str) -> Result<PathBuf> {
+    let full_name = wide(full_name);
+    let mut length = 0;
+    let first = unsafe {
+        GetPackagePathByFullName(
+            full_name.as_ptr(),
+            &mut length,
+            std::ptr::null_mut(),
+        )
+    };
+    if first != ERROR_INSUFFICIENT_BUFFER || length == 0 {
+        bail!("cannot resolve official desktop package path");
+    }
+    let mut buffer = vec![0u16; length as usize];
+    let result = unsafe {
+        GetPackagePathByFullName(full_name.as_ptr(), &mut length, buffer.as_mut_ptr())
+    };
+    if result != 0 {
+        bail!("cannot resolve official desktop package path");
+    }
+    let end = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
+    Ok(PathBuf::from(String::from_utf16_lossy(&buffer[..end])))
+}
+
+fn is_under(path: &Path, root: &Path) -> bool {
+    let normalize = |value: &Path| {
+        value
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    let path = normalize(path);
+    let root = normalize(root);
+    path == root || path.starts_with(&(root + "\\"))
+}
+
+fn windows_apps_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for variable in ["ProgramW6432", "ProgramFiles"] {
+        if let Some(value) = std::env::var_os(variable) {
+            let root = PathBuf::from(value).join("WindowsApps");
+            if !roots.iter().any(|existing| same_path(existing, &root)) {
+                roots.push(root);
+            }
+        }
+    }
+    let fallback = PathBuf::from(r"C:\Program Files\WindowsApps");
+    if !roots.iter().any(|existing| same_path(existing, &fallback)) {
+        roots.push(fallback);
+    }
+    roots
+}
+
+fn package_executable(root: PathBuf) -> Option<PathBuf> {
+    if !windows_apps_roots()
+        .iter()
+        .any(|windows_apps| is_under(&root, windows_apps))
+    {
+        return None;
+    }
+    let executable = root.join("app").join("ChatGPT.exe");
+    executable.is_file().then_some(executable)
+}
+
+struct DesktopCandidate {
+    version: [u64; 4],
+    executable: PathBuf,
+    running: bool,
+}
+
+fn add_desktop_candidate(
+    candidates: &mut Vec<DesktopCandidate>,
+    executable: PathBuf,
+    family: &str,
+    running: bool,
+) {
+    let Some(app_directory) = executable.parent() else {
+        return;
+    };
+    let Some(root) = app_directory.parent() else {
+        return;
+    };
+    let Some(name) = root.file_name().and_then(|value| value.to_str()) else {
+        return;
+    };
+    let Some(version) = package_version(name, family) else {
+        return;
+    };
+    let Some(valid_executable) = package_executable(root.to_owned()) else {
+        return;
+    };
+    if !same_path(&valid_executable, &executable) {
+        return;
+    }
+    if let Some(existing) = candidates
+        .iter_mut()
+        .find(|candidate| same_path(&candidate.executable, &executable))
+    {
+        existing.running |= running;
+        return;
+    }
+    candidates.push(DesktopCandidate {
+        version,
+        executable,
+        running,
+    });
+}
+
+fn collect_running_desktop_candidates(
+    candidates: &mut Vec<DesktopCandidate>,
+    family: &str,
+) {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return;
+    }
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of_val(&entry) as u32;
+    let mut available = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while available {
+        let end = entry
+            .szExeFile
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(entry.szExeFile.len());
+        if String::from_utf16_lossy(&entry.szExeFile[..end]).eq_ignore_ascii_case("ChatGPT.exe")
+        {
+            if let Ok(path) = image(entry.th32ProcessID) {
+                add_desktop_candidate(candidates, path, family, true);
+            }
+        }
+        available = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        CloseHandle(snapshot);
+    }
+}
+
+fn resolve_desktop_executable(family: &str, fallback: Option<&Path>) -> Result<PathBuf> {
+    let mut candidates = Vec::new();
+    // Keep forwarding the process that is actually running until it exits. This
+    // prevents an update from switching rules away from the old process halfway
+    // through an MSIX replacement.
+    collect_running_desktop_candidates(&mut candidates, family);
+    if let Ok(names) = package_full_names(family) {
+        for full_name in names {
+            if let Ok(root) = package_path(&full_name) {
+                if let Some(executable) = package_executable(root) {
+                    add_desktop_candidate(&mut candidates, executable, family, false);
+                }
+            }
+        }
+    }
+    // GetPackagesByPackageFamily is user-scoped. The SYSTEM service may not
+    // have a package graph, so use the protected WindowsApps store as a
+    // read-only fallback for the same exact package family.
+    for windows_apps in windows_apps_roots() {
+        if let Ok(entries) = std::fs::read_dir(windows_apps) {
+            for entry in entries.flatten() {
+                if let Some(executable) = package_executable(entry.path()) {
+                    add_desktop_candidate(&mut candidates, executable, family, false);
+                }
+            }
+        }
+    }
+    // The saved path is deliberately last-resort only. It still passes the
+    // same package-family and WindowsApps checks, so a stale or foreign path
+    // cannot become a valid candidate merely because it is in the JSON file.
+    if let Some(path) = fallback {
+        add_desktop_candidate(&mut candidates, path.to_owned(), family, false);
+    }
+    let running = candidates.iter().filter(|candidate| candidate.running);
+    if let Some(candidate) = running.max_by_key(|candidate| candidate.version) {
+        return Ok(candidate.executable.clone());
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|candidate| candidate.version)
+        .map(|candidate| candidate.executable)
+        .context("official Codex desktop package was not found")
 }
 
 fn image(pid: u32) -> Result<PathBuf> {
@@ -348,7 +646,9 @@ fn status(
         "desktop_pid": session.desktop_pid, "desktop_started": session.desktop_started,
         "bridge_pid": bridge_pid, "bridge_started": bridge_started,
         "proxy_port": request.map(|r| r.proxy_port), "session_shared": true,
-        "tcp_ports": [80, 443], "quic_blocked": state == "running",
+        "tcp_ports": [53, 80, 443], "quic_blocked": false,
+        "dns_scope": "matched-process-only", "system_dns_service_intercepted": false,
+        "udp_proxied": state == "running", "udp_direct_fallback": false,
         "timestamp": super::storage::now(), "error": error});
         let path = &session.status_path;
         let directory = path.parent().context("missing bridge status directory")?;
@@ -361,7 +661,7 @@ fn status(
     })
 }
 
-pub(super) fn attach(runtime: &super::Runtime) -> Result<Option<BridgeLease>> {
+fn target() -> Result<Option<(u32, PathBuf)>> {
     let executable = std::env::current_exe()?;
     // Ordinary terminal/tool invocations must not create another desktop filter.
     if !std::env::args_os()
@@ -382,7 +682,48 @@ pub(super) fn attach(runtime: &super::Runtime) -> Result<Option<BridgeLease>> {
         return Ok(None);
     };
     verify(&desktop_executable, &config.desktop_sha256)?;
-    session::attach(runtime, desktop_pid, desktop_executable).map(Some)
+    Ok(Some((desktop_pid, desktop_executable)))
+}
+
+pub(super) fn needs_owned_kernel() -> Result<bool> {
+    Ok(target()?.is_some())
+}
+
+pub(super) async fn attach(runtime: &super::Runtime) -> Result<Option<BridgeLease>> {
+    let Some((desktop_pid, desktop_executable)) = target()? else {
+        return Ok(None);
+    };
+    let desktop_started = started(desktop_pid)?;
+    let lease = session::attach(runtime, desktop_pid, desktop_executable)?;
+    let owner = std::process::id();
+    let owner_started = started(owner)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let status_path =
+        super::storage::directory(&runtime.home).join("desktop-forwarding-status.json");
+    loop {
+        if let Ok(value) = read_json::<serde_json::Value>(&status_path) {
+            if value["desktop_pid"].as_u64() == Some(u64::from(desktop_pid))
+                && value["desktop_started"].as_u64() == Some(desktop_started)
+            {
+                let current_owner = value["owner_pid"].as_u64() == Some(u64::from(owner))
+                    && value["owner_started"].as_u64() == Some(owner_started);
+                if value["state"] == "running" && value["forwarding_ready"] == true && current_owner
+                {
+                    return Ok(Some(lease));
+                }
+                if value["state"] == "elevation-denied"
+                    || (value["state"] == "failed"
+                        && (current_owner || value["owner_pid"].is_null()))
+                {
+                    bail!("desktop forwarding authorization or worker startup failed");
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("timed out waiting for this backend's desktop forwarding worker");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 pub(super) fn run(path: &Path) -> Result<()> {
@@ -464,7 +805,7 @@ fn run_inner(path: &Path, request: &Request, session: &session::Session) -> Resu
     {
         bail!("invalid forwarding owner or endpoint");
     }
-    let (directory, config) = distribution()?;
+    let (_, config) = distribution()?;
     let owner = super::windows::ParentProcess::open(request.owner_pid)?;
     let desktop = super::windows::ParentProcess::open(request.desktop_pid)?;
     if !same_path(&image(request.owner_pid)?, &std::env::current_exe()?)
@@ -474,6 +815,83 @@ fn run_inner(path: &Path, request: &Request, session: &session::Session) -> Resu
     {
         bail!("desktop forwarding process identity mismatch");
     }
+    let _forwarding = start_forwarding(request.proxy_port, &request.proxy_password, &request.owner_sid, true)?;
+    let result = (|| -> Result<()> {
+        status(session, "running", Some(request), None)?;
+        while owner.running()?
+            && desktop.running()?
+            && as_desktop_user(session, || Ok(path.is_file()))?
+        {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        Ok(())
+    })();
+    drop(_forwarding);
+    let _ = status(session, "waiting-for-backend", None, None);
+    result
+}
+
+pub(super) struct ForwardingGuard {
+    _module: windows_sys::Win32::Foundation::HMODULE,
+    stop: Option<unsafe extern "C" fn() -> i32>,
+    upstream_ready: Option<unsafe extern "C" fn(i32)>,
+    edit_rule: Option<unsafe extern "C" fn(u32, *const i8, *const i8, *const i8, *const i8, i32, i32, u32) -> i32>,
+    desktop_tcp_rule: u32,
+    desktop_udp_rule: u32,
+    desktop_tcp_proxy: u32,
+    desktop_udp_proxy: u32,
+    pub(super) desktop_executable: PathBuf,
+}
+impl ForwardingGuard {
+    pub(super) fn tcp_relay_port(&self) -> Result<u16> {
+        let pointer = unsafe { GetProcAddress(self._module, c"ProxyBridge_GetTcpRelayPort".as_ptr().cast()) }
+            .context("missing TCP relay port entrypoint")?;
+        let get_port = unsafe {
+            std::mem::transmute::<unsafe extern "system" fn() -> isize, unsafe extern "C" fn() -> u32>(pointer)
+        };
+        let port = u16::try_from(unsafe { get_port() }).context("invalid TCP relay port")?;
+        if port == 0 { bail!("TCP relay listener is not ready"); }
+        Ok(port)
+    }
+    pub(super) fn ready(&self) {
+        if let Some(ready) = self.upstream_ready { unsafe { ready(1); } }
+    }
+
+    pub(super) fn refresh_desktop(&self, current: &Path) -> Result<Option<PathBuf>> {
+        let next = resolve_desktop_executable(DEFAULT_DESKTOP_PACKAGE_FAMILY, Some(current))?;
+        if same_path(&next, current) {
+            return Ok(None);
+        }
+        let edit_rule = self.edit_rule.context("missing packet rule editor")?;
+        let process = CString::new(next.to_string_lossy().as_bytes())?;
+        let hosts = CString::new("*")?;
+        let domains = CString::new("")?;
+        let tcp_ports = CString::new("53;80;443")?;
+        let udp_ports = CString::new("*")?;
+        unsafe {
+            if edit_rule(self.desktop_tcp_rule, process.as_ptr(), hosts.as_ptr(), tcp_ports.as_ptr(), domains.as_ptr(), 0, 0, self.desktop_tcp_proxy) == 0
+                || edit_rule(self.desktop_udp_rule, process.as_ptr(), hosts.as_ptr(), udp_ports.as_ptr(), domains.as_ptr(), 1, 0, self.desktop_udp_proxy) == 0
+            {
+                bail!("cannot refresh dedicated desktop forwarding rules");
+            }
+        }
+        Ok(Some(next))
+    }
+}
+impl Drop for ForwardingGuard {
+    fn drop(&mut self) {
+        // Keep the DLL mapped: accepted native workers may still be unwinding.
+        if let Some(stop) = self.stop { unsafe { stop(); } }
+    }
+}
+// Used by the administrator session worker and the persistent SYSTEM service.
+// Rule installation does not depend on any desktop process existing yet.
+pub(super) fn start_forwarding(port: u16, password: &str, owner_sid: &str, initially_ready: bool) -> Result<ForwardingGuard> {
+    if unsafe { IsUserAnAdmin() } == 0 || port == 0 ||
+        !super::storage::is_acceptable_password(password) || !owner_sid.starts_with("S-1-") {
+        bail!("invalid privileged forwarding configuration");
+    }
+    let (directory, config) = distribution()?;
     verify(&config.desktop_executable, &config.desktop_sha256)?;
     verify(&directory.join("ProxyBridge.dll"), &config.bridge_sha256)?;
     verify(
@@ -516,15 +934,41 @@ fn run_inner(path: &Path, request: &Request, session: &session::Session) -> Resu
         "ProxyBridge_AddRule",
         unsafe extern "C" fn(*const i8, *const i8, *const i8, *const i8, i32, i32, u32) -> u32
     );
+    let edit_rule = function!(
+        "ProxyBridge_EditRule",
+        unsafe extern "C" fn(u32, *const i8, *const i8, *const i8, *const i8, i32, i32, u32) -> i32
+    );
     let traffic_logging = function!(
         "ProxyBridge_SetTrafficLoggingEnabled",
         unsafe extern "C" fn(i32)
     );
     let start = function!("ProxyBridge_Start", unsafe extern "C" fn() -> i32);
     let stop = function!("ProxyBridge_Stop", unsafe extern "C" fn() -> i32);
-    let sid = CString::new(request.owner_sid.as_str())?;
-    let process = CString::new(request.desktop_executable.to_string_lossy().as_bytes())?;
-    let password = CString::new(request.proxy_password.as_str())?;
+    let upstream_ready = function!("ProxyBridge_SetUpstreamReady", unsafe extern "C" fn(i32));
+    let mut guard = ForwardingGuard {
+        _module: module,
+        stop: None,
+        upstream_ready: None,
+        edit_rule: Some(edit_rule),
+        desktop_tcp_rule: 0,
+        desktop_udp_rule: 0,
+        desktop_tcp_proxy: 0,
+        desktop_udp_proxy: 0,
+        desktop_executable: config.desktop_executable.clone(),
+    };
+    guard.stop = Some(stop);
+    guard.upstream_ready = Some(upstream_ready);
+    unsafe { upstream_ready(i32::from(initially_ready)); }
+    let sid = CString::new(owner_sid)?;
+    let process = CString::new(config.desktop_executable.to_string_lossy().as_bytes())?;
+    // The CLI itself owns service-owned channels that deliberately bypass the in-process
+    // dedicated proxy (remote exec-server/cloud environments, telemetry). Those connections
+    // would otherwise leave the machine directly and stall on handshake in restricted
+    // networks. Cover the CLI executable with the same forwarding rule so every outbound
+    // TCP 80/443 from this distribution reaches the local kernel. The kernel binary has a
+    // different file name, so it is never matched and cannot loop through itself.
+    let cli = CString::new(directory.join("codex.exe").to_string_lossy().as_bytes())?;
+    let password = CString::new(password)?;
     unsafe {
         if set_owner(sid.as_ptr()) == 0 {
             bail!("cannot restrict packet forwarding to its owner");
@@ -533,50 +977,71 @@ fn run_inner(path: &Path, request: &Request, session: &session::Session) -> Resu
         let proxy = add_proxy(
             0,
             c"127.0.0.1".as_ptr(),
-            request.proxy_port,
+            port,
             c"codex".as_ptr(),
             password.as_ptr(),
+            1,
+        );
+        let udp_proxy = add_proxy(
+            1,
+            c"127.0.0.1".as_ptr(),
+            port,
+            c"codex".as_ptr(),
+            password.as_ptr(),
+            1,
+        );
+        let desktop_tcp_rule = add_rule(
+            process.as_ptr(),
+            c"*".as_ptr(),
+            c"53;80;443".as_ptr(),
+            c"".as_ptr(),
             0,
+            0,
+            proxy,
+        );
+        let desktop_udp_rule = add_rule(
+            process.as_ptr(),
+            c"*".as_ptr(),
+            c"*".as_ptr(),
+            c"".as_ptr(),
+            1,
+            0,
+            udp_proxy,
+        );
+        let cli_tcp_rule = add_rule(
+            cli.as_ptr(),
+            c"*".as_ptr(),
+            c"53;80;443".as_ptr(),
+            c"".as_ptr(),
+            0,
+            0,
+            proxy,
+        );
+        let cli_udp_rule = add_rule(
+            cli.as_ptr(),
+            c"*".as_ptr(),
+            c"*".as_ptr(),
+            c"".as_ptr(),
+            1,
+            0,
+            udp_proxy,
         );
         if proxy == 0
-            || add_rule(
-                process.as_ptr(),
-                c"*".as_ptr(),
-                c"80;443".as_ptr(),
-                c"".as_ptr(),
-                0,
-                0,
-                proxy,
-            ) == 0
-            || add_rule(
-                process.as_ptr(),
-                c"*".as_ptr(),
-                c"443".as_ptr(),
-                c"".as_ptr(),
-                1,
-                2,
-                proxy,
-            ) == 0
+            || udp_proxy == 0
+            || desktop_tcp_rule == 0
+            || desktop_udp_rule == 0
+            || cli_tcp_rule == 0
+            || cli_udp_rule == 0
         {
             bail!("cannot configure dedicated desktop forwarding rules");
         }
         if start() == 0 {
             bail!("dedicated packet forwarding driver did not start");
         }
+        guard.desktop_tcp_rule = desktop_tcp_rule;
+        guard.desktop_udp_rule = desktop_udp_rule;
+        guard.desktop_tcp_proxy = proxy;
+        guard.desktop_udp_proxy = udp_proxy;
     }
-    let result = (|| -> Result<()> {
-        status(session, "running", Some(request), None)?;
-        while owner.running()?
-            && desktop.running()?
-            && as_desktop_user(session, || Ok(path.is_file()))?
-        {
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        Ok(())
-    })();
-    unsafe {
-        stop();
-    }
-    let _ = status(session, "waiting-for-backend", None, None);
-    result
+    Ok(guard)
 }

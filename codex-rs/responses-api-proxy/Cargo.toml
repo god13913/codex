@@ -20,12 +20,14 @@ workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 codex-process-hardening = { workspace = true }
+codex-dedicated-proxy = { workspace = true }
 ctor = { workspace = true }
 libc = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tiny_http = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 zeroize = { workspace = true }
 
 [dev-dependencies]

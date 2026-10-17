@@ -55,6 +55,10 @@ void add_connection(UINT16 src_port, BOOL is_udp, UINT32 src_ip, UINT32 dest_ip,
             existing->orig_dest_port = dest_port;
             existing->proxy_config_id = proxy_config_id;
             existing->is_tracked = TRUE;
+            existing->tcp_fin_mask = 0;
+            existing->tcp_reset = FALSE;
+            existing->tcp_closed_at = 0;
+            existing->tcp_syn_seen = FALSE;
             existing->last_activity = GetTickCount64();
             rev_insert(existing);
             ReleaseSRWLockExclusive(&lock);
@@ -101,6 +105,10 @@ void add_connection_v6(UINT16 src_port, BOOL is_udp, const UINT8 src_ip6[16], co
             existing->orig_dest_port = dest_port;
             existing->proxy_config_id = proxy_config_id;
             existing->is_tracked = TRUE;
+            existing->tcp_fin_mask = 0;
+            existing->tcp_reset = FALSE;
+            existing->tcp_closed_at = 0;
+            existing->tcp_syn_seen = FALSE;
             existing->last_activity = GetTickCount64();
             rev_insert(existing);
             ReleaseSRWLockExclusive(&lock);
@@ -293,6 +301,59 @@ void remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6)
     ReleaseSRWLockExclusive(&lock);
 }
 
+// Preserve the mapping through a TCP half-close and the final ACK/retransmits.
+// Repeated FIN/RST packets never extend the bounded terminal grace period.
+void note_tcp_close(UINT16 src_port, BOOL is_ipv6, BOOL from_relay, BOOL fin, BOOL rst)
+{
+    if (!fin && !rst) return;
+    AcquireSRWLockExclusive(&lock);
+    for (CONNECTION_INFO *c = connection_hash_table[src_port % CONNECTION_HASH_SIZE]; c; c = c->next) {
+        if (c->src_port != src_port || c->is_udp || c->is_ipv6 != is_ipv6) continue;
+        if (fin) c->tcp_fin_mask |= from_relay ? 2 : 1;
+        if (rst) c->tcp_reset = TRUE;
+        c->last_activity = GetTickCount64();
+        if (!c->tcp_closed_at && (c->tcp_reset || c->tcp_fin_mask == 3))
+            c->tcp_closed_at = c->last_activity;
+        break;
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+void remember_tcp_syn(UINT16 src_port, BOOL is_ipv6, UINT32 sequence)
+{
+    AcquireSRWLockExclusive(&lock);
+    for (CONNECTION_INFO *c = connection_hash_table[src_port % CONNECTION_HASH_SIZE]; c; c = c->next) {
+        if (c->src_port == src_port && !c->is_udp && c->is_ipv6 == is_ipv6) {
+            c->tcp_syn_sequence = sequence;
+            c->tcp_syn_seen = TRUE;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
+// Keep SYN retransmissions on the original relay. A new initial sequence or
+// endpoint tuple reuses the local port and must get a fresh process/rule decision.
+void prepare_tcp_syn(UINT16 src_port, BOOL is_ipv6, const void *src, const void *dest, UINT16 dest_port, UINT32 sequence)
+{
+    AcquireSRWLockExclusive(&lock);
+    CONNECTION_INFO **pp = &connection_hash_table[src_port % CONNECTION_HASH_SIZE];
+    while (*pp) {
+        CONNECTION_INFO *c = *pp;
+        if (c->src_port == src_port && !c->is_udp && c->is_ipv6 == is_ipv6) {
+            BOOL same_tuple = c->orig_dest_port == dest_port && (is_ipv6
+                ? !memcmp(c->src_ip6, src, 16) && !memcmp(c->orig_dest_ip6, dest, 16)
+                : !memcmp(&c->src_ip, src, 4) && !memcmp(&c->orig_dest_ip, dest, 4));
+            if (!same_tuple || !c->tcp_syn_seen || c->tcp_syn_sequence != sequence) {
+                *pp = c->next; rev_unlink(c); free(c);
+            }
+            break;
+        }
+        pp = &c->next;
+    }
+    ReleaseSRWLockExclusive(&lock);
+}
+
 void cleanup_stale_connections(void)
 {
     ULONGLONG now = GetTickCount64();
@@ -304,14 +365,16 @@ void cleanup_stale_connections(void)
 
         while (*conn_ptr != NULL)
         {
-            if (now - (*conn_ptr)->last_activity > CONNECTION_STALE_TIMEOUT_MS)
+            CONNECTION_INFO *current = *conn_ptr;
+            ULONGLONG grace = current->tcp_reset ? CONNECTION_RESET_GRACE_MS : CONNECTION_CLOSE_GRACE_MS;
+            BOOL closed = !current->is_udp && current->tcp_closed_at &&
+                now >= current->tcp_closed_at && now - current->tcp_closed_at > grace;
+            if (closed || (now >= current->last_activity && now - current->last_activity > CONNECTION_STALE_TIMEOUT_MS))
             {
                 CONNECTION_INFO *to_free = *conn_ptr;
                 *conn_ptr = (*conn_ptr)->next;
                 rev_unlink(to_free);              // must run under the exclusive lock
-                ReleaseSRWLockExclusive(&lock);
                 free(to_free);
-                AcquireSRWLockExclusive(&lock);
             }
             else
             {
@@ -332,9 +395,7 @@ void cleanup_stale_connections(void)
             {
                 PID_CACHE_ENTRY *to_free = *entry_ptr;
                 *entry_ptr = (*entry_ptr)->next;
-                ReleaseSRWLockExclusive(&lock);
                 free(to_free);
-                AcquireSRWLockExclusive(&lock);
             }
             else
             {
@@ -463,7 +524,9 @@ BOOL get_relay_response_v4(BOOL outbound, UINT32 src, UINT32 dst, UINT16 sp, UIN
     for (CONNECTION_INFO *c=connection_hash_table[dp % CONNECTION_HASH_SIZE]; c!=NULL; c=c->next)
         if (ld_relay_v4(outbound,src,dst,sp,dp,(UINT16)g_local_relay_port,c->is_tracked,c->is_udp,c->is_ipv6,
             c->src_ip,c->orig_dest_ip,c->src_port,c->orig_dest_port))
-        { *original_port=c->orig_dest_port; found=TRUE; break; }
+        { *original_port=c->orig_dest_port;
+          InterlockedExchange64((LONGLONG volatile*)&c->last_activity, (LONGLONG)GetTickCount64());
+          found=TRUE; break; }
     ReleaseSRWLockShared(&lock);
     return found;
 }
@@ -474,7 +537,9 @@ BOOL get_relay_response_v6(BOOL outbound, const UINT8 src[16], const UINT8 dst[1
     for (CONNECTION_INFO *c=connection_hash_table[dp % CONNECTION_HASH_SIZE]; c!=NULL; c=c->next)
         if (ld_relay_v6(outbound,src,dst,sp,dp,(UINT16)g_local_relay_port,c->is_tracked,c->is_udp,c->is_ipv6,
             c->src_ip6,c->orig_dest_ip6,c->src_port,c->orig_dest_port))
-        { *original_port=c->orig_dest_port; found=TRUE; break; }
+        { *original_port=c->orig_dest_port;
+          InterlockedExchange64((LONGLONG volatile*)&c->last_activity, (LONGLONG)GetTickCount64());
+          found=TRUE; break; }
     ReleaseSRWLockShared(&lock);
     return found;
 }

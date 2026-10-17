@@ -158,7 +158,7 @@ int send_all(SOCKET sock, const char *buf, int len)
     int sent = 0;
     while (sent < len) {
         int n = send(sock, buf + sent, len - sent, 0);
-        if (n == SOCKET_ERROR) return SOCKET_ERROR;
+        if (n <= 0) return SOCKET_ERROR;
         sent += n;
     }
     return sent;

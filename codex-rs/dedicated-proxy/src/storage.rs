@@ -30,6 +30,29 @@ impl Mode {
     }
 }
 
+/// Default fixed proxy port. A fixed port lets sibling processes (for example a
+/// standalone exec-server) reach the kernel that an already running app-server owns
+/// instead of starting a second one.
+pub const DEFAULT_PROXY_PORT: u16 = 35234;
+
+/// Default fixed proxy password. It must be exactly 64 ASCII hex characters because
+/// desktop forwarding request validation enforces that shape; a shorter value makes
+/// every endpoint fail validation and the forwarding worker never starts.
+pub const DEFAULT_PROXY_PASSWORD: &str =
+    "a3f1c0dea3f1c0dea3f1c0dea3f1c0dea3f1c0dea3f1c0dea3f1c0dea3f1c0de";
+
+/// Compile-time guard so the default password can never drift out of the 64-hex
+/// shape that forwarding validation requires.
+const _: () = {
+    assert!(DEFAULT_PROXY_PASSWORD.len() == 64);
+    let bytes = DEFAULT_PROXY_PASSWORD.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        assert!(bytes[i].is_ascii_hexdigit());
+        i += 1;
+    }
+};
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct Settings {
     pub enabled: bool,
@@ -37,6 +60,132 @@ pub struct Settings {
     pub mode: Mode,
     pub updated_at: u64,
     pub last_error: Option<String>,
+    /// Fixed local proxy port. `0` (or missing) means [`DEFAULT_PROXY_PORT`].
+    #[serde(default)]
+    pub proxy_port: u16,
+    /// Fixed proxy password. Must be 64 ASCII hex characters; anything else falls
+    /// back to [`DEFAULT_PROXY_PASSWORD`] so forwarding validation keeps working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_password: Option<String>,
+    /// DNS-over-HTTPS endpoints the private kernel resolves with. Missing means
+    /// [`DEFAULT_DNS_NAMESERVERS`]; set it to `[]` to disable kernel-side resolution and
+    /// let the OS resolver answer instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_nameservers: Option<Vec<String>>,
+    /// Plain resolvers used only to reach `dns_nameservers`; missing means
+    /// [`DEFAULT_DNS_BOOTSTRAP`]. Ignored when `dns_nameservers` is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_bootstrap: Option<Vec<String>>,
+}
+
+/// Returns `true` when `value` matches the shape desktop forwarding validation expects.
+pub fn is_acceptable_password(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Resolves the effective port, falling back to the built-in default.
+pub fn effective_proxy_port(settings: &Settings) -> u16 {
+    if settings.proxy_port == 0 {
+        DEFAULT_PROXY_PORT
+    } else {
+        settings.proxy_port
+    }
+}
+
+/// Resolves the effective password, falling back to the built-in default.
+pub fn effective_proxy_password(settings: &Settings) -> String {
+    match settings.proxy_password.as_deref() {
+        Some(value) if is_acceptable_password(value) => value.to_owned(),
+        _ => DEFAULT_PROXY_PASSWORD.to_owned(),
+    }
+}
+
+/// DoH endpoints the kernel resolves with, used whenever `settings.json` does not carry
+/// `dns_nameservers`. Both are Tencent DNSPod endpoints: they answer from inside mainland
+/// China (measured 0.5s and 2.0s) and return the real Cloudflare addresses for ChatGPT
+/// hosts, where the local resolver answers with dead Facebook/Twitter addresses.
+pub const DEFAULT_DNS_NAMESERVERS: &[&str] =
+    &["https://doh.pub/dns-query", "https://1.12.12.12/dns-query"];
+
+/// Plain resolvers used only to reach the DoH endpoints above, so the kernel can
+/// bootstrap its own encrypted resolution without depending on the OS resolver.
+/// `223.5.5.5` is Alibaba AliDNS, `119.29.29.29` is Tencent DNSPod.
+pub const DEFAULT_DNS_BOOTSTRAP: &[&str] = &["223.5.5.5", "119.29.29.29"];
+
+/// Upper bound for operator-supplied resolver lists.
+const MAX_DNS_ENTRIES: usize = 8;
+
+/// Trims, de-duplicates and caps an operator-supplied resolver list. An empty result
+/// is legal and means "let the kernel fall back to the OS resolver".
+fn sanitize_resolvers(values: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() || out.len() >= MAX_DNS_ENTRIES || out.iter().any(|v| v == value) {
+            continue;
+        }
+        out.push(value.to_owned());
+    }
+    out
+}
+
+/// Resolves the DoH endpoints for the kernel. **On by default** (`None` -> see
+/// [`DEFAULT_DNS_NAMESERVERS`]).
+///
+/// Why the kernel needs a resolver of its own: the sniffer turns a hijacked packet back
+/// into a hostname, but the kernel still resolves that hostname locally before dialing the
+/// node. Measured - pinning the ChatGPT hosts in the hosts file is what made cloud replies
+/// load again, so the locally resolved address really is on the forwarding path, and a
+/// poisoned OS resolver makes every tunnel stall until a retry re-resolves the name.
+///
+/// This is *not* Clash's remote resolution: Mihomo dials these DoH endpoints itself, from
+/// this machine, so they must be reachable without a proxy. That is acceptable because the
+/// answer only has to be *correct* - the node is what actually connects to it. Set
+/// `dns_nameservers` to `[]` in settings.json to fall back to plain OS resolution.
+pub fn effective_dns_nameservers(settings: &Settings) -> Vec<String> {
+    match settings.dns_nameservers.as_ref() {
+        Some(values) => sanitize_resolvers(values),
+        None => DEFAULT_DNS_NAMESERVERS.iter().map(|v| (*v).to_owned()).collect(),
+    }
+}
+
+/// Bootstrap resolvers used to reach [`effective_dns_nameservers`], and — as the kernel's
+/// `default-nameserver` plus `proxy-server-nameserver` — to resolve the node's own host
+/// name directly, never through the loopback resolver (that would deadlock on the tunnel).
+///
+/// Mihomo rejects a `default-nameserver` entry that is not a plain IP, and rejects an
+/// empty `default-nameserver` outright; rejecting the whole configuration would take the
+/// dedicated proxy down, so anything else is dropped and an empty result falls back to
+/// [`DEFAULT_DNS_BOOTSTRAP`].
+pub fn effective_dns_bootstrap(settings: &Settings) -> Vec<String> {
+    let values = match settings.dns_bootstrap.as_ref() {
+        Some(values) => sanitize_resolvers(values),
+        None => DEFAULT_DNS_BOOTSTRAP.iter().map(|v| (*v).to_owned()).collect(),
+    };
+    let filtered: Vec<String> = values
+        .into_iter()
+        .filter(|value| value.parse::<std::net::IpAddr>().is_ok())
+        .collect();
+    if filtered.is_empty() {
+        DEFAULT_DNS_BOOTSTRAP.iter().map(|v| (*v).to_owned()).collect()
+    } else {
+        filtered
+    }
+}
+
+/// Builds the fixed local endpoint other processes can reuse without starting a
+/// second kernel. Returns `None` when the dedicated proxy is not enabled.
+pub fn endpoint_for(settings: &Settings) -> Option<String> {
+    if !settings.enabled {
+        return None;
+    }
+    let port = effective_proxy_port(settings);
+    let password = effective_proxy_password(settings);
+    Some(if password.is_empty() {
+        format!("http://127.0.0.1:{port}")
+    } else {
+        format!("http://codex:{password}@127.0.0.1:{port}")
+    })
 }
 
 /// Credential-bearing configuration, encrypted for the current Windows user.
@@ -95,7 +244,7 @@ impl VpsProfile {
             Value::String("chrome".into()),
         );
         node.insert(Value::String("network".into()), Value::String("ws".into()));
-        node.insert(Value::String("udp".into()), Value::Bool(false));
+        node.insert(Value::String("udp".into()), Value::Bool(true));
 
         let mut headers = Mapping::new();
         headers.insert(
@@ -279,10 +428,10 @@ fn read_private(path: &Path) -> Result<Vec<u8>> {
 
 pub(super) fn unprotect(bytes: &[u8]) -> Result<Vec<u8>> {
     if let Ok(envelope) = serde_json::from_slice::<ProtectedEnvelope>(bytes) {
-        if envelope.format != "codex-dpapi-v1" { bail!("unsupported protected proxy configuration"); }
+        if envelope.format != "codex-dpapi-v1" && envelope.format != "codex-dpapi-machine-v1" { bail!("unsupported protected proxy configuration"); }
         let encrypted = base64::engine::general_purpose::STANDARD.decode(envelope.data)
             .map_err(|_| anyhow::anyhow!("invalid protected proxy configuration"))?;
-        return crypt(&encrypted, false);
+        return crypt(&encrypted, false, false);
     }
     // Read existing private JSON without changing the active installation.
     Ok(bytes.to_vec())
@@ -291,21 +440,27 @@ pub(super) fn unprotect(bytes: &[u8]) -> Result<Vec<u8>> {
 pub(super) fn protect(bytes: &[u8]) -> Result<Vec<u8>> {
     #[cfg(windows)]
     { serde_json::to_vec(&ProtectedEnvelope { format: "codex-dpapi-v1".into(),
-        data: base64::engine::general_purpose::STANDARD.encode(crypt(bytes, true)?) }).map_err(Into::into) }
+        data: base64::engine::general_purpose::STANDARD.encode(crypt(bytes, true, false)?) }).map_err(Into::into) }
     #[cfg(not(windows))]
     { Ok(bytes.to_vec()) }
 }
 
-fn crypt(bytes: &[u8], encrypt: bool) -> Result<Vec<u8>> {
+#[cfg(windows)]
+pub(super) fn protect_machine(bytes: &[u8]) -> Result<Vec<u8>> {
+    serde_json::to_vec(&ProtectedEnvelope { format: "codex-dpapi-machine-v1".into(),
+        data: base64::engine::general_purpose::STANDARD.encode(crypt(bytes, true, true)?) }).map_err(Into::into)
+}
+
+fn crypt(bytes: &[u8], encrypt: bool, machine: bool) -> Result<Vec<u8>> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Security::Cryptography::{CRYPT_INTEGER_BLOB, CryptProtectData,
-            CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN};
+            CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPTPROTECT_LOCAL_MACHINE};
         let input = CRYPT_INTEGER_BLOB { cbData: bytes.len().try_into()?, pbData: bytes.as_ptr().cast_mut() };
         let mut output: CRYPT_INTEGER_BLOB = unsafe { std::mem::zeroed() };
         let result = unsafe { if encrypt {
             CryptProtectData(&input, std::ptr::null(), std::ptr::null(), std::ptr::null(),
-                std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
+                std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN | if machine { CRYPTPROTECT_LOCAL_MACHINE } else { 0 }, &mut output)
         } else {
             CryptUnprotectData(&input, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(),
                 std::ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output)
@@ -316,7 +471,7 @@ fn crypt(bytes: &[u8], encrypt: bool) -> Result<Vec<u8>> {
         Ok(value)
     }
     #[cfg(not(windows))]
-    { let _ = (bytes, encrypt); bail!("protected proxy configuration requires Windows"); }
+    { let _ = (bytes, encrypt, machine); bail!("protected proxy configuration requires Windows"); }
 }
 
 pub fn node_profile(home: &Path) -> Result<Mapping> {
@@ -727,7 +882,11 @@ fn sanitize_node(mut node: Mapping) -> Result<Mapping> {
         node.remove(Value::String(field.into()));
     }
     node.insert(Value::String("name".into()), Value::String("CODEX".into()));
-    node.insert(Value::String("udp".into()), Value::Bool(false));
+    // The dedicated policy attempts UDP through the selected node. Previous
+    // versions forcibly cached udp=false, so normalize cached nodes as well as
+    // new imports. HTTP has no UDP transport; the kernel's terminal REJECT rule
+    // must catch it instead of Mihomo's implicit DIRECT fallback.
+    node.insert(Value::String("udp".into()), Value::Bool(kind != "http"));
     Ok(node)
 }
 
@@ -749,7 +908,7 @@ mod tests {
         assert!(!node.contains_key(Value::String("dialer-proxy".into())));
         assert_eq!(
             node.get(Value::String("udp".into())).unwrap().as_bool(),
-            Some(false)
+            Some(true)
         );
     }
     #[test]
@@ -768,9 +927,20 @@ mod tests {
         );
         assert_eq!(
             node.get(Value::String("udp".into())).unwrap().as_bool(),
-            Some(false)
+            Some(true)
         );
     }
+    #[test]
+    fn legacy_udp_flag_is_repaired_but_http_cannot_enable_udp() {
+        let mut legacy = parse_subscription(NODE.as_bytes()).unwrap();
+        legacy.insert(Value::String("udp".into()), Value::Bool(false));
+        let repaired = sanitize_node(legacy).unwrap();
+        assert_eq!(repaired.get(Value::String("udp".into())).and_then(Value::as_bool), Some(true));
+
+        let http = parse_subscription(b"proxies:\n- type: http\n  server: example.invalid\n  port: 8080\n  udp: true\n").unwrap();
+        assert_eq!(http.get(Value::String("udp".into())).and_then(Value::as_bool), Some(false));
+    }
+
     #[test]
     fn imports_one_base64_trojan_share_link() {
         let link = "trojan://password@example.com:443?security=tls&type=ws&sni=example.com&host=example.com&path=%2Fcodex&fp=chrome#single";

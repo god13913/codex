@@ -8,6 +8,12 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "--configure-runtime")
+        {
+            try { Environment.ExitCode = RuntimeModeInstaller.RunElevatedAsync(args).GetAwaiter().GetResult(); }
+            catch { Environment.ExitCode = 13; }
+            return;
+        }
         if (args.Length == 1 && args[0] == "--upgrade-runtime")
         {
             try { UpgradeRuntimeAsync().GetAwaiter().GetResult(); }
@@ -27,6 +33,7 @@ internal static class Program
 
     private static async Task UpgradeRuntimeAsync()
     {
+        using var update = ManagedRuntime.AcquireUpdate();
         using var metadata = PrivateStore.Read("configurator.json")
             ?? throw new InvalidOperationException("尚未保存代理配置。");
         using var settings = PrivateStore.Read("settings.json")
@@ -44,27 +51,24 @@ internal static class Program
         var selectedCli = Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.User);
         if (!string.Equals(Path.GetFullPath(oldCli), selectedCli is null ? null : Path.GetFullPath(selectedCli),
                 StringComparison.OrdinalIgnoreCase))
-            throw new InvalidOperationException("当前 CLI 路径与已有配置不一致，不自动覆盖。");
+            throw new InvalidOperationException("当前命令行与已保存的配置不一致，请重新保存一次。");
 
-        var runtime = await RuntimeInstaller.InstallAsync(new Progress<string>(_ => { }));
-        RuntimeInstaller.RegisterDesktop(runtime, desktop);
-        var newCli = Path.Combine(runtime, "codex.exe");
-        fields["runtime_directory"] = JsonSerializer.SerializeToElement(runtime);
-        try
-        {
-            Environment.SetEnvironmentVariable("CODEX_CLI_PATH", newCli, EnvironmentVariableTarget.User);
-            if (!string.Equals(Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.User),
-                    newCli, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("无法保存新的 CLI 路径。");
-            PrivateStore.Write("configurator.json", fields);
-            BroadcastEnvironment();
-        }
+        var mode = RuntimeModeInstaller.CurrentMode();
+        RuntimeModeInstaller.Preflight(mode);
+        var runtime = mode == RuntimeModeInstaller.Service ? "" : await RuntimeInstaller.InstallAsync(new Progress<string>(_ => { }));
+        if (runtime.Length != 0) RuntimeInstaller.RegisterDesktop(runtime, desktop);
+        var saved = RuntimeModeInstaller.Snapshot();
+        var oldProcess = Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.Process);
+        try { await RuntimeModeInstaller.ApplyAsync(mode, desktop, runtime); }
         catch
         {
+            RuntimeModeInstaller.Restore(saved);
             Environment.SetEnvironmentVariable("CODEX_CLI_PATH", selectedCli, EnvironmentVariableTarget.User);
-            BroadcastEnvironment();
+            Environment.SetEnvironmentVariable("CODEX_CLI_PATH", oldProcess, EnvironmentVariableTarget.Process);
+            RuntimeInstaller.BroadcastEnvironment();
             throw;
         }
+        finally { foreach (var bytes in saved.Values) if (bytes is not null) System.Security.Cryptography.CryptographicOperations.ZeroMemory(bytes); }
     }
 
     private static void BroadcastEnvironment() =>

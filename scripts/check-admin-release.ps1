@@ -103,7 +103,8 @@ Assert-Check ((Get-FileHash -LiteralPath (Join-Path $distribution 'ProxyBridge.d
 $native = Get-PeInformation (Join-Path $distribution 'ProxyBridge.dll') $true
 Assert-Check ($native.Machine -eq 0x8664) 'Native bridge is not x64'
 $expectedExports = @('ProxyBridge_Start','ProxyBridge_Stop','ProxyBridge_SetOwnerSid',
-    'ProxyBridge_AddProxyConfig','ProxyBridge_AddRule','ProxyBridge_SetTrafficLoggingEnabled')
+    'ProxyBridge_AddProxyConfig','ProxyBridge_AddRule','ProxyBridge_SetTrafficLoggingEnabled',
+    'ProxyBridge_GetTcpRelayPort','ProxyBridge_SetUpstreamReady')
 foreach ($name in $expectedExports) {
     Assert-Check ($native.Exports -contains $name) "Missing native forwarding entrypoint: $name"
 }

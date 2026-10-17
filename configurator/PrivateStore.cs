@@ -53,12 +53,18 @@ internal static class PrivateStore
             "subscription-cache.json" => 4 * 1024 * 1024 + 4096,
             _ => 8 * 1024 * 1024
         };
-        if (bytes.Length > limit) throw new InvalidOperationException("配置超过运行组件的大小限制，请使用较短的订阅链接或精简节点配置。");
+        if (bytes.Length > limit) throw new InvalidOperationException("配置内容太大了，请换用较短的订阅链接或精简节点配置。");
         var path = Path.Combine(DirectoryPath, name);
         var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
         using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
         { file.Write(bytes); file.Flush(true); }
         File.Move(temporary, path, true);
+    }
+
+    internal static void RestoreBytes(string name, byte[] bytes)
+    {
+        SecureDirectory(DirectoryPath);
+        WriteBytes(name, bytes);
     }
 
     internal static void MigrateCredentialFile(string name)
@@ -100,6 +106,25 @@ internal static class PrivateStore
             return JsonDocument.Parse(System.Text.Encoding.UTF8.GetString(bytes));
         }
         finally { System.Security.Cryptography.CryptographicOperations.ZeroMemory(bytes); }
+    }
+
+    internal static void DeleteDedicatedProxy()
+    {
+        if (!Directory.Exists(DirectoryPath)) return;
+        var pending = new Stack<string>();
+        pending.Push(DirectoryPath);
+        while (pending.TryPop(out var current))
+        {
+            ManagedRuntime.AssertNoLinks(current);
+            foreach (var entry in Directory.EnumerateFileSystemEntries(current))
+            {
+                ManagedRuntime.AssertNoLinks(entry);
+                if (Directory.Exists(entry)) pending.Push(entry);
+            }
+        }
+        Directory.Delete(DirectoryPath, true);
+        if (Directory.Exists(DirectoryPath))
+            throw new IOException("专属代理配置目录仍然存在。");
     }
 
     internal static JsonDocument ReadProtectedFile(string path)

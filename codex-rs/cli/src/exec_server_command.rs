@@ -166,6 +166,11 @@ impl ExecServerCommand {
     ) -> anyhow::Result<()> {
         let strict_config = self.strict_config;
         self.validate_remote_transport()?;
+        let _dedicated_proxy = if self.remote.is_some() {
+            codex_dedicated_proxy::start_service_if_enabled(&find_codex_home()?).await?
+        } else {
+            None
+        };
         let websocket_auth = self.websocket_auth.try_into_settings()?;
         if websocket_auth.config.is_some() && (self.remote.is_some() || self.command.is_some()) {
             anyhow::bail!("WebSocket listener auth cannot be used with --remote or forward");

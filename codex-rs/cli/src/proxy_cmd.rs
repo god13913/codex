@@ -8,6 +8,9 @@ pub struct ProxyCommand {
 
 #[derive(Debug, Subcommand)]
 enum ProxySubcommand {
+    /// Internal installer action. Writes only to the protected service sibling directory.
+    #[command(hide = true)]
+    ServicePrepare,
     /// Internal administrator forwarding process; the normal CLI starts it automatically.
     #[command(hide = true)]
     Bridge {
@@ -54,6 +57,11 @@ enum ProxySubcommand {
 pub async fn run(command: ProxyCommand) -> anyhow::Result<()> {
     let home = codex_core::config::find_codex_home()?;
     let (action, stdin) = match command.command {
+        ProxySubcommand::ServicePrepare => {
+            codex_dedicated_proxy::prepare_persistent_service(&home)?;
+            println!("{{\"service_prepared\":true}}");
+            return Ok(());
+        }
         ProxySubcommand::Bridge { request } => {
             return codex_dedicated_proxy::run_desktop_bridge(&request);
         }

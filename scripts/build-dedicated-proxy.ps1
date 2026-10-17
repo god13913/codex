@@ -1,5 +1,5 @@
-param(
-    [ValidateSet('Check', 'Test', 'KernelTest', 'RouteTest', 'Release')][string]$Stage = 'Release',
+﻿param(
+    [ValidateSet('Check', 'Test', 'KernelTest', 'RouteTest', 'Dev', 'Release')][string]$Stage = 'Release',
     [string]$CorePath = '',
     [string]$BuildProxy = '',
     [string]$RegistryBridge = '',
@@ -15,7 +15,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 # No machine-specific default: every caller must pass a pinned Mihomo executable.
-if ($Stage -eq 'Release' -and -not $CorePath) { throw 'Pass -CorePath with a pinned Mihomo executable.' }
+if ($Stage -in @('Dev', 'Release') -and -not $CorePath) { throw 'Pass -CorePath with a pinned Mihomo executable.' }
 
 # Collapse duplicate-cased environment variables (http_proxy vs HTTP_PROXY, https_proxy vs
 # HTTPS_PROXY). Windows environment names are case-insensitive; importing a batch environment
@@ -28,13 +28,16 @@ foreach ($proxyPair in @(
     )) {
     $lower = $proxyPair[0]
     $upper = $proxyPair[1]
-    $lowerValue = [Environment]::GetEnvironmentVariable($lower, 'Process')
-    $upperValue = [Environment]::GetEnvironmentVariable($upper, 'Process')
-    if ($null -ne $lowerValue -and $null -ne $upperValue) {
+    $proxyValue = [Environment]::GetEnvironmentVariable($upper, 'Process')
+    if ($null -eq $proxyValue) {
+        $proxyValue = [Environment]::GetEnvironmentVariable($lower, 'Process')
+    }
+    if ($null -ne $proxyValue) {
+        # Both names refer to the same Windows variable. Preserve its value before
+        # removing either spelling, then restore exactly one canonical entry.
         [Environment]::SetEnvironmentVariable($lower, $null, 'Process')
-    } elseif ($null -ne $lowerValue) {
-        [Environment]::SetEnvironmentVariable($upper, $lowerValue, 'Process')
-        [Environment]::SetEnvironmentVariable($lower, $null, 'Process')
+        [Environment]::SetEnvironmentVariable($upper, $null, 'Process')
+        [Environment]::SetEnvironmentVariable($upper, $proxyValue, 'Process')
     }
 }
 
@@ -110,7 +113,7 @@ if ($voiceEnabled) {
         }
     }
 }
-if ($Stage -eq 'Release') {
+if ($Stage -in @('Dev', 'Release')) {
     if ($RgPath) {
         $rgSource = [IO.Path]::GetFullPath($RgPath)
     } elseif ($voicePackageRoot) {
@@ -289,17 +292,19 @@ if ($manifestTool) {
     throw 'Windows SDK mt.exe is required to link manifest-bearing sandbox helpers'
 }
 $nativeOutput = Join-Path $env:CARGO_TARGET_DIR 'native-proxybridge'
-if ($Stage -eq 'Release') {
+if ($Stage -in @('Dev', 'Release')) {
     $nativeSource = Join-Path $repoRoot 'third_party\proxybridge'
     $windivert = Join-Path $workspaceRoot 'third-party\windivert-2.2.2'
     $nativeSources = @('ProxyBridge.c','pb_util.c','pb_process.c','pb_rules.c','pb_proxy.c','pb_dns.c','pb_socks5.c','pb_http.c','pb_conntrack.c','pb_relay.c') |
         ForEach-Object { Join-Path $nativeSource $_ }
     New-Item -ItemType Directory -Path $nativeOutput -Force | Out-Null
     Push-Location $nativeOutput
+    $nativePreference = $ErrorActionPreference
     try {
+        $ErrorActionPreference = 'Continue'
         & cl.exe /nologo /utf-8 /O2 /MT /GS /guard:cf /W3 /D_CRT_SECURE_NO_WARNINGS /D_WINSOCK_DEPRECATED_NO_WARNINGS /DPROXYBRIDGE_EXPORTS /DNDEBUG "/I$windivert" @nativeSources /LD /link /DYNAMICBASE /HIGHENTROPYVA /NXCOMPAT /guard:cf /CETCOMPAT "/LIBPATH:$windivert" WinDivert.lib ws2_32.lib iphlpapi.lib advapi32.lib "/OUT:$nativeOutput\ProxyBridge.dll"
         if ($LASTEXITCODE -ne 0) { throw 'Dedicated native packet bridge build failed' }
-    } finally { Pop-Location }
+    } finally { $ErrorActionPreference = $nativePreference; Pop-Location }
 }
 Push-Location (Join-Path $repoRoot 'codex-rs')
 try {
@@ -311,20 +316,25 @@ try {
         $env:CARGO_HTTP_PROXY = ''
         $env:CARGO_HTTP_TIMEOUT = '240'
     }
+    $cargoPreference = $ErrorActionPreference
+    try {
+    $ErrorActionPreference = 'Continue'
     if ($Stage -eq 'Check') {
-        & $cargo @registryArguments check -p codex-dedicated-proxy -p codex-cli --bin codex
+        & $cargo @registryArguments check -p codex-dedicated-proxy -p codex-cli --bin codex --bin codex-proxy-service
     } elseif ($Stage -eq 'Test') {
         & $cargo @registryArguments test -p codex-dedicated-proxy -p codex-http-client -p codex-websocket-client --lib
     } elseif ($Stage -eq 'RouteTest') {
         & $cargo @registryArguments test -p codex-login -p codex-exec-server --lib dedicated_proxy
     } elseif ($Stage -eq 'KernelTest') {
         if ((Get-FileHash -LiteralPath $CorePath -Algorithm SHA256).Hash -ne '3C107D54EF1B895E4980B53F517D52F3C1137101FA2637347C9CE343FC50D7B2') { throw 'Pinned Mihomo checksum mismatch' }
-        New-Item -ItemType Directory -Path 'target\debug\deps' -Force | Out-Null
-        Copy-Item -LiteralPath $CorePath -Destination 'target\debug\deps\codex-mihomo.exe'
+        $kernelTestDirectory = Join-Path $env:CARGO_TARGET_DIR 'debug\deps'
+        New-Item -ItemType Directory -Path $kernelTestDirectory -Force -ErrorAction Stop | Out-Null
+        Copy-Item -LiteralPath $CorePath -Destination (Join-Path $kernelTestDirectory 'codex-mihomo.exe') -ErrorAction Stop
         & $cargo @registryArguments test -p codex-dedicated-proxy --lib --features serde_json/arbitrary_precision -- --ignored
     } else {
         $releaseBinaries = @(
             'codex',
+            'codex-proxy-service',
             'codex-code-mode-host',
             'codex-windows-sandbox-setup',
             'codex-windows-sandbox-service',
@@ -334,10 +344,13 @@ try {
         $releaseBinaryArguments = foreach ($binary in $releaseBinaries) {
             @('--bin', $binary)
         }
-        & $cargo @registryArguments build --release @releaseBinaryArguments
+        $profileArguments = @()
+        if ($Stage -eq 'Release') { $profileArguments += '--release' }
+        & $cargo @registryArguments build @profileArguments @releaseBinaryArguments
     }
-    if ($LASTEXITCODE -ne 0) { throw "Cargo $Stage failed" }
-    if ($Stage -eq 'Release') {
+    if ($LASTEXITCODE -ne 0) { throw "Cargo $Stage failed (exit $LASTEXITCODE)" }
+    } finally { $ErrorActionPreference = $cargoPreference }
+    if ($Stage -in @('Dev', 'Release')) {
         $destination = if ($OutputDirectory) { [IO.Path]::GetFullPath($OutputDirectory) } else { Join-Path $workspaceRoot 'release\CodexDedicated' }
         New-Item -ItemType Directory -Path $destination -Force | Out-Null
         if ((Get-FileHash -LiteralPath $CorePath -Algorithm SHA256).Hash -ne '3C107D54EF1B895E4980B53F517D52F3C1137101FA2637347C9CE343FC50D7B2') { throw 'Pinned Mihomo checksum mismatch' }
@@ -346,7 +359,9 @@ try {
         New-Item -ItemType Directory -Path $packageResources, $packagePath -Force | Out-Null
         foreach ($binary in $releaseBinaries) {
             if ($binary -ne 'codex-voice-host') {
-                $binarySource = Join-Path $env:CARGO_TARGET_DIR "release\$binary.exe"
+                $profileDirectory = 'debug'
+                if ($Stage -eq 'Release') { $profileDirectory = 'release' }
+                $binarySource = Join-Path $env:CARGO_TARGET_DIR "$profileDirectory\$binary.exe"
                 # Keep the root copy for the dedicated launcher and legacy helper lookup.
                 Copy-Item -LiteralPath $binarySource -Destination $destination
                 if ($binary -in @('codex-command-runner', 'codex-windows-sandbox-setup')) {
@@ -418,9 +433,11 @@ try {
         }
         Copy-Item -LiteralPath (Join-Path $windivert 'WinDivert-LGPL.txt'), (Join-Path $windivert 'WinDivert-v2.2.2-source.zip') -Destination $destination
         Copy-Item -LiteralPath (Join-Path $repoRoot 'third_party\proxybridge\LICENSE') -Destination (Join-Path $destination 'LICENSE-ProxyBridge.txt')
-        $bridgeSources = (Get-ChildItem -LiteralPath (Join-Path $repoRoot 'third_party\proxybridge') -File).FullName
+        $bridgeSources = @((Get-ChildItem -LiteralPath (Join-Path $repoRoot 'third_party\proxybridge') -File).FullName)
+        $bridgeSources += Join-Path $repoRoot 'third_party\proxybridge\tests'
         Compress-Archive -LiteralPath $bridgeSources -DestinationPath (Join-Path $destination 'ProxyBridge-source.zip') -Force
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'configure-desktop-forwarding.ps1') -Destination $destination
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'manage-desktop-proxy-service.ps1') -Destination $destination
         & (Join-Path $PSScriptRoot 'configure-desktop-forwarding.ps1') -DistributionDirectory $destination
         if (!$?) { throw 'Desktop forwarding configuration failed' }
         Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE') -Destination (Join-Path $destination 'LICENSE-Codex.txt')
@@ -435,7 +452,7 @@ try {
         }
         $distributionLabel = if ($voiceEnabled) { 'Codex 0.162.0 + Mihomo 1.19.32 + official voice runtime' } else { 'Codex 0.162.0 + Mihomo 1.19.32' }
         Write-Utf8NoBom -Path (Join-Path $destination 'codex-dedicated-proxy.distribution') -Content $distributionLabel
-        $buildResultJson = @{ success=$true; stage='Release'; targetDirectory=$env:CARGO_TARGET_DIR; outputDirectory=$destination;
+        $buildResultJson = @{ success=$true; stage=$Stage; targetDirectory=$env:CARGO_TARGET_DIR; outputDirectory=$destination;
            freshBuild=[bool]$FreshBuild; voiceEnabled=$voiceEnabled; testsRun=$false; completedAt=[DateTimeOffset]::Now.ToString('o') } |
            ConvertTo-Json
         Write-Utf8NoBom -Path (Join-Path $destination 'build-result.json') -Content $buildResultJson

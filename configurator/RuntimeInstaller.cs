@@ -11,22 +11,23 @@ internal static class RuntimeInstaller
 {
     private sealed record Manifest(string BundleId, Dictionary<string, string> Files);
     private static Stream Resource(string name) => Assembly.GetExecutingAssembly().GetManifestResourceStream(name)
-        ?? throw new InvalidOperationException("此配置器没有完整的内置运行组件，请使用正式发布文件。");
+        ?? throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
 
     internal static async Task<string> InstallAsync(IProgress<string> progress)
     {
         using var manifestStream = Resource("runtime-manifest.json");
         var manifest = JsonSerializer.Deserialize<Manifest>(manifestStream, PrivateStore.Json)
-            ?? throw new InvalidOperationException("内置运行组件不完整。");
+            ?? throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
         if (manifest.BundleId.Length != 16 || manifest.BundleId.Any(c => !Uri.IsHexDigit(c)))
-            throw new InvalidOperationException("内置版本标识不正确。");
-        var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CodexProxy", "Runtime");
+            throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
+        var root = ManagedRuntime.UserRoot;
+        ManagedRuntime.AssertNoLinks(root);
         PrivateStore.SecureDirectory(root);
         var destination = Path.Combine(root, manifest.BundleId);
         if (System.IO.Directory.Exists(destination))
         {
             progress.Report("检查已安装的运行组件…");
-            try { await VerifyAsync(destination, manifest); return destination; }
+            try { ManagedRuntime.AssertNoLinks(destination); await VerifyAsync(destination, manifest); ManagedRuntime.Mark(destination, RuntimeModeInstaller.Desktop); return destination; }
             catch (InvalidOperationException)
             {
                 destination = Path.Combine(root, manifest.BundleId + "-" + Guid.NewGuid().ToString("N")[..8]);
@@ -35,33 +36,84 @@ internal static class RuntimeInstaller
         }
         var staging = Path.Combine(root, ".install-" + Guid.NewGuid().ToString("N"));
         PrivateStore.SecureDirectory(staging);
+        ManagedRuntime.Mark(staging, RuntimeModeInstaller.Desktop);
+        try
+        {
         using var resource = Resource("runtime.zip");
         using var zip = new ZipArchive(resource, ZipArchiveMode.Read);
         var index = 0;
         foreach (var (name, expected) in manifest.Files)
         {
-            if (Path.GetFileName(name) != name || name.Contains(':')) throw new InvalidOperationException("内置文件名不正确。");
-            var entry = zip.GetEntry(name) ?? throw new InvalidOperationException("内置运行组件缺失。");
-            if (entry.Length > 600 * 1024 * 1024) throw new InvalidOperationException("内置组件大小不正确。");
+            if (Path.GetFileName(name) != name || name.Contains(':')) throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
+            var entry = zip.GetEntry(name) ?? throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
+            if (entry.Length > 600 * 1024 * 1024) throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
             progress.Report($"安装运行组件 {++index}/{manifest.Files.Count}…");
             var path = Path.Combine(staging, name);
             await using (var input = entry.Open())
             await using (var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 131072, true))
                 await input.CopyToAsync(output);
-            if (!await HashMatchesAsync(path, expected)) throw new InvalidOperationException("内置运行组件校验失败。");
+            if (!await HashMatchesAsync(path, expected)) throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
         }
         if (!manifest.Files.ContainsKey("codex.exe") || !manifest.Files.ContainsKey("codex-mihomo.exe") ||
             !manifest.Files.ContainsKey("WinDivert64.sys") || !manifest.Files.ContainsKey("ProxyBridge.dll"))
-            throw new InvalidOperationException("内置运行组件不完整。");
+            throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
         System.IO.Directory.Move(staging, destination);
         return destination;
+        }
+        catch { ManagedRuntime.Discard(staging, RuntimeModeInstaller.Desktop); throw; }
     }
 
     private static async Task VerifyAsync(string directory, Manifest manifest)
     {
+        ManagedRuntime.AssertNoLinks(directory);
         foreach (var (name, hash) in manifest.Files)
+        {
+            if (Path.GetFileName(name) != name || name.Contains(':')) throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
+            ManagedRuntime.AssertNoLinks(Path.Combine(directory, name));
             if (!await HashMatchesAsync(Path.Combine(directory, name), hash))
-                throw new InvalidOperationException("已安装组件不完整或被修改，请重新下载正式配置器。");
+                throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
+        }
+    }
+
+    internal static async Task VerifyInstalledAsync(string directory)
+    {
+        using var stream = Resource("runtime-manifest.json");
+        var manifest = JsonSerializer.Deserialize<Manifest>(stream, PrivateStore.Json)
+            ?? throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
+        await VerifyAsync(directory, manifest);
+    }
+
+    internal static async Task<string> InstallProtectedAsync()
+    {
+        using var stream = Resource("runtime-manifest.json");
+        var manifest = JsonSerializer.Deserialize<Manifest>(stream, PrivateStore.Json)
+            ?? throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
+        if (manifest.BundleId.Length != 16 || manifest.BundleId.Any(c => !Uri.IsHexDigit(c)) ||
+            !manifest.Files.ContainsKey("codex-proxy-service.exe")) throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
+        var root = Path.Combine(ManagedRuntime.ServiceRoot,
+            "CodexDedicatedProxy-Setup-" + manifest.BundleId + "-" + Guid.NewGuid().ToString("N")[..8]);
+        RuntimeModeInstaller.Protect(root, true);
+        ManagedRuntime.Mark(root, RuntimeModeInstaller.Service);
+        var runtime = Path.Combine(root, "runtime");
+        try
+        {
+        RuntimeModeInstaller.Protect(runtime, true);
+        using var zipStream = Resource("runtime.zip");
+        using var zip = new ZipArchive(zipStream, ZipArchiveMode.Read);
+        foreach (var (name, hash) in manifest.Files)
+        {
+            if (Path.GetFileName(name) != name || name.Contains(':')) throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
+            var entry = zip.GetEntry(name) ?? throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
+            if (entry.Length > 600 * 1024 * 1024) throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
+            var path = Path.Combine(runtime, name);
+            await using (var input = entry.Open())
+            await using (var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 131072, true))
+                await input.CopyToAsync(output);
+            if (!await HashMatchesAsync(path, hash)) throw new InvalidOperationException("安装文件不完整或已损坏，请重新下载正式版配置器。");
+        }
+        return runtime;
+        }
+        catch { ManagedRuntime.Discard(runtime, RuntimeModeInstaller.Service); throw; }
     }
 
     private static async Task<bool> HashMatchesAsync(string path, string hash)
@@ -76,7 +128,7 @@ internal static class RuntimeInstaller
         DesktopLocator.Verify(desktop);
         var registration = new
         {
-            Schema = 1, DesktopExecutable = desktop,
+            Schema = 1, DesktopPackageFamily = DesktopLocator.PackageFamily, DesktopExecutable = desktop,
             DesktopSha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(desktop))),
             BridgeSha256 = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(Path.Combine(runtime, "ProxyBridge.dll"))))
         };
@@ -100,12 +152,14 @@ internal static class RuntimeInstaller
     {
         Environment.SetEnvironmentVariable("CODEX_CLI_PATH", null, EnvironmentVariableTarget.User);
         if (Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.User) is not null)
-            throw new InvalidOperationException("无法清除 CLI 设置。");
+            throw new InvalidOperationException("无法恢复官方命令行设置，请重启电脑后再试。");
         Environment.SetEnvironmentVariable("CODEX_CLI_PATH", null, EnvironmentVariableTarget.Process);
+        if (Environment.GetEnvironmentVariable("CODEX_CLI_PATH", EnvironmentVariableTarget.Process) is not null)
+            throw new InvalidOperationException("无法恢复官方命令行设置，请重启电脑后再试。");
         BroadcastEnvironment();
     }
 
-    private static void BroadcastEnvironment() =>
+    internal static void BroadcastEnvironment() =>
         SendMessageTimeout(new IntPtr(0xFFFF), 0x001A, IntPtr.Zero, "Environment", 2, 5000, out _);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]

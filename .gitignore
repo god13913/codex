@@ -106,3 +106,8 @@ __pycache__/
 /build-tools/**/obj/
 /runtime/
 /release/
+
+# Local assistant/session data. Never publish these directories, even when a
+# local tool creates them below the repository root.
+**/.workbuddy/
+**/conversations/

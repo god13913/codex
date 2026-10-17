@@ -33,7 +33,7 @@ internal static class NodeExitProbe
                 ["authentication"] = new[] { $"probe:{password}" }, ["skip-auth-prefixes"] = Array.Empty<string>(),
                 ["tun"] = new { enable = false }, ["dns"] = new { enable = false },
                 ["profile"] = new Dictionary<string, bool> { ["store-selected"] = false, ["store-fake-ip"] = false },
-                ["proxies"] = new[] { node }, ["rules"] = new[] { "MATCH,CODEX" }
+                ["proxies"] = new[] { node }, ["rules"] = new[] { "MATCH,CODEX", "MATCH,REJECT" }
             };
             var configPath = Path.Combine(directory, "probe.yaml");
             await File.WriteAllBytesAsync(configPath, JsonSerializer.SerializeToUtf8Bytes(configuration));
@@ -77,7 +77,7 @@ internal static class NodeExitProbe
             }
             catch (HttpRequestException)
             {
-                throw new InvalidOperationException("所选节点无法连接 IPinfo，请检查节点网络。");
+                throw new InvalidOperationException("所选节点无法连接检测服务器，请检查节点网络是否正常。");
             }
         }
         finally

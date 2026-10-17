@@ -66,6 +66,10 @@ PROXYBRIDGE_API void ProxyBridge_SetTrafficLoggingEnabled(BOOL enable);
 PROXYBRIDGE_API void ProxyBridge_ClearConnectionLogs(void);  // Clear connection history from memory
 PROXYBRIDGE_API BOOL ProxyBridge_Start(void);
 PROXYBRIDGE_API BOOL ProxyBridge_Stop(void);
+PROXYBRIDGE_API void ProxyBridge_SetUpstreamReady(BOOL ready);
+// The service configures its inbound firewall rule for this exact bound port.
+// Zero means the dual-stack relay has not finished starting.
+PROXYBRIDGE_API UINT32 ProxyBridge_GetTcpRelayPort(void);
 // Dedicated launcher: only processes owned by the configured Windows identity.
 PROXYBRIDGE_API BOOL ProxyBridge_SetOwnerSid(const char* sid);
 #ifdef __cplusplus

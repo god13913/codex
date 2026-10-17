@@ -45,6 +45,7 @@ BOOL get_relay_response_v6(BOOL outbound, const UINT8 src[16], const UINT8 dst[1
 #define HTTP_BUFFER_SIZE 1024
 #define FILTER_BUFFER_SIZE 1024
 #define LOG_BUFFER_SIZE 1024
+void pb_build_packet_filter(char filter[FILTER_BUFFER_SIZE], UINT16 relay_port);
 #define MAX_LIST_SIZE 65536  // max byte length for semicolon-delimited host/port/process lists
 
 typedef struct PROCESS_RULE {
@@ -68,12 +69,14 @@ typedef struct PROCESS_RULE {
 #define SOCKS5_ATYP_DOMAIN 0x03  // send hostname to proxy rfc 1928
 #define SOCKS5_AUTH_NONE   0x00
 
-// Idle timeout before a connection-tracking entry is reaped. Clean closes are removed
-// immediately on FIN/RST, so this only sweeps entries whose FIN/RST was missed. It MUST
+// Idle timeout before a connection-tracking entry is reaped. A single FIN is a
+// half-close, not the end of both directions. This timeout MUST
 // exceed the relay's TCP keepalive interval (5 min) and real idle periods (IMAP IDLE,
 // voice channels, WebSocket, DB pools) - otherwise an open-but-idle proxied connection
 // gets reaped mid-session and silently breaks until restart (issue: hours-long degradation).
 #define CONNECTION_STALE_TIMEOUT_MS 1800000  // 30 minutes
+#define CONNECTION_CLOSE_GRACE_MS 60000     // Keep final ACKs / FIN retransmits mapped.
+#define CONNECTION_RESET_GRACE_MS 5000      // Short grace after a reset.
 
 // DNS snooping cache: maps intercepted A-record answers to their hostnames so
 // that SOCKS5 conect can forward ATYP_DOMAIN instead of ATYP_IPV4, letting
@@ -86,6 +89,7 @@ typedef struct DNS_CACHE_ENTRY {
     UINT32 ip;              // network-byte-order IPv4
     char   domain[256];
     ULONGLONG expire_tick;
+    BOOL ambiguous;        // Shared CDN addresses must never select an arbitrary hostname.
     struct DNS_CACHE_ENTRY *next;
 } DNS_CACHE_ENTRY;
 
@@ -93,6 +97,7 @@ typedef struct DNS_CACHE_ENTRY_V6 {
     UINT8  ip6[16];         // raw IPv6 address
     char   domain[256];
     ULONGLONG expire_tick;
+    BOOL ambiguous;
     struct DNS_CACHE_ENTRY_V6 *next;
 } DNS_CACHE_ENTRY_V6;
 
@@ -112,6 +117,11 @@ typedef struct CONNECTION_INFO {
     struct CONNECTION_INFO *rev_next;  // chain in the reverse table (keyed by orig_dest)
     UINT32 rev_bucket;                 // reverse bucket this entry is currently linked in
     BOOL   in_rev;                     // TRUE while linked in the reverse table
+    UINT8  tcp_fin_mask;                // 1 = client FIN, 2 = relay FIN
+    BOOL   tcp_reset;
+    ULONGLONG tcp_closed_at;            // Set once on both FINs or RST
+    UINT32 tcp_syn_sequence;
+    BOOL   tcp_syn_seen;
 } CONNECTION_INFO;
 
 typedef struct {
@@ -123,9 +133,12 @@ typedef struct {
     UINT8  orig_dest_ip6[16];
 } CONNECTION_CONFIG;
 
+typedef struct PB_DNS_TRACKER PB_DNS_TRACKER;
+
 typedef struct {
     SOCKET from_socket;
     SOCKET to_socket;
+    PB_DNS_TRACKER *dns;
 } TRANSFER_CONFIG;
 
 // Two-thread bidirectional relay: each direction runs in its own thread so
@@ -134,6 +147,8 @@ typedef struct {
     SOCKET sock_client;   // app-side socket
     SOCKET sock_proxy;    // proxy-side socket
     volatile LONG refs;   // ref-count; last thread out closes both sockets
+    volatile LONG aborted; // Wake the sibling even when shutdown does not wake select.
+    PB_DNS_TRACKER *dns;
 } RELAY_PAIR;
 
 typedef struct {
@@ -177,6 +192,10 @@ typedef struct {
 } PROXY_CONFIG;
 
 typedef BOOL (*token_match_func)(const char *token, const void *data);
+
+BOOL pb_forward_udp(const void *packet, UINT packet_len, const WINDIVERT_ADDRESS *address,
+    UINT32 config_id, DWORD pid);
+BOOL pb_udp_stop(void);
 
 // ---- shared globals (defined in ProxyBridge.c) ----
 extern PROXY_CONFIG g_proxy_configs[MAX_PROXY_CONFIGS];
@@ -305,14 +324,27 @@ BOOL is_proxy_config_referenced(UINT32 config_id);
 void dns_cache_init(void);
 UINT32 dns_bucket(UINT32 ip);
 void dns_cache_store(UINT32 ip, const char *domain);
+void dns_cache_store_ttl(UINT32 ip, const char *domain, UINT32 ttl);
 BOOL dns_cache_lookup(UINT32 ip, char *out_domain, size_t out_size);
 UINT32 dns_bucket_v6(const UINT8 ip6[16]);
 void dns_cache_store_v6(const UINT8 ip6[16], const char *domain);
+void dns_cache_store_v6_ttl(const UINT8 ip6[16], const char *domain, UINT32 ttl);
 BOOL dns_cache_lookup_v6(const UINT8 ip6[16], char *out_domain, size_t out_size);
 BOOL dns_parse_name(const UINT8 *msg, int msg_len, int *offset, char *dst, int dst_len);
 void snoop_dns_response(const UINT8 *payload, int payload_len);
 void cleanup_stale_dns_cache(void);
 void flush_dns_resolver_cache(void);
+PB_DNS_TRACKER *pb_dns_tracker_new(void);
+void pb_dns_tracker_free(PB_DNS_TRACKER *tracker);
+void pb_dns_observe(PB_DNS_TRACKER *tracker, BOOL response, const BYTE *data, UINT length);
+void pb_dns_stream(PB_DNS_TRACKER *tracker, BOOL response, const BYTE *data, UINT length);
+
+// ---- pb_hostname.c (included by pb_relay.c) ----
+BOOL pb_valid_hostname(const char *host);
+int pb_tls_hostname(const BYTE *data, UINT length, char host[256]);
+int pb_http_hostname(const BYTE *data, UINT length, char host[256]);
+BOOL pb_peek_hostname(SOCKET client, UINT16 port, char host[256]);
+BOOL pb_wait_upstream(void);
 
 // ---- pb_socks5.c ----
 int socks5_read_connect_reply(SOCKET s, int *reply);
@@ -325,6 +357,7 @@ BOOL establish_udp_associate_for_config(PROXY_CONFIG *cfg);
 // ---- pb_http.c ----
 int http_connect_v6(SOCKET s, const UINT8 dest_ip6[16], UINT16 dest_port, const PROXY_CONFIG *cfg);
 int http_connect(SOCKET s, UINT32 dest_ip, UINT16 dest_port, const PROXY_CONFIG *cfg);
+int http_connect_domain(SOCKET s, const char *host, UINT16 port, const PROXY_CONFIG *cfg);
 
 // ---- pb_conntrack.c ----
 UINT32 rev_hash_v4(UINT32 dest_ip, UINT16 dest_port);
@@ -340,6 +373,9 @@ BOOL get_connection(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *dest_
 BOOL get_connection_full(UINT16 src_port, BOOL is_udp, UINT32 *dest_ip, UINT16 *dest_port, UINT32 *proxy_config_id);
 UINT32 get_connection_proxy_id(UINT16 src_port, BOOL is_udp);
 void remove_connection(UINT16 src_port, BOOL is_udp, BOOL is_ipv6);
+void note_tcp_close(UINT16 src_port, BOOL is_ipv6, BOOL from_relay, BOOL fin, BOOL rst);
+void remember_tcp_syn(UINT16 src_port, BOOL is_ipv6, UINT32 sequence);
+void prepare_tcp_syn(UINT16 src_port, BOOL is_ipv6, const void *src, const void *dest, UINT16 dest_port, UINT32 sequence);
 void cleanup_stale_connections(void);
 BOOL is_connection_already_logged(DWORD pid, UINT32 dest_ip, UINT16 dest_port, RuleAction action);
 void add_logged_connection(DWORD pid, UINT32 dest_ip, UINT16 dest_port, RuleAction action);

@@ -4422,6 +4422,7 @@ version = "0.162.0"
 dependencies = [
  "anyhow",
  "clap",
+ "codex-dedicated-proxy",
  "codex-process-hardening",
  "ctor 0.6.3",
  "libc",
@@ -4430,6 +4431,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tiny_http",
+ "tokio",
  "zeroize",
 ]
 

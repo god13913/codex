@@ -17,7 +17,14 @@ UINT32 dns_bucket(UINT32 ip)
 
 void dns_cache_store(UINT32 ip, const char *domain)
 {
-    if (!domain || domain[0] == '\0') return;
+    dns_cache_store_ttl(ip, domain, DNS_CACHE_TTL_MS / 1000);
+}
+
+void dns_cache_store_ttl(UINT32 ip, const char *domain, UINT32 ttl)
+{
+    if (!domain || !pb_valid_hostname(domain)) return;
+    ULONGLONG lifetime = (ULONGLONG)ttl * 1000;
+    if (lifetime > DNS_CACHE_TTL_MS) lifetime = DNS_CACHE_TTL_MS;
     UINT32 bucket = dns_bucket(ip);
     ULONGLONG now = GetTickCount64();
 
@@ -27,8 +34,12 @@ void dns_cache_store(UINT32 ip, const char *domain)
     {
         if (e->ip == ip)
         {
+            if (e->expire_tick <= now) e->ambiguous = FALSE;
+            else if (_stricmp(e->domain, domain)) e->ambiguous = TRUE;
+            ULONGLONG expiry = now + lifetime;
+            if (e->ambiguous && expiry < e->expire_tick) expiry = e->expire_tick;
             strncpy_s(e->domain, sizeof(e->domain), domain, _TRUNCATE);
-            e->expire_tick = now + DNS_CACHE_TTL_MS;
+            e->expire_tick = expiry;
             ReleaseSRWLockExclusive(&g_dns_cache_lock);
             return;
         }
@@ -38,7 +49,8 @@ void dns_cache_store(UINT32 ip, const char *domain)
     if (ne)
     {
         ne->ip         = ip;
-        ne->expire_tick = now + DNS_CACHE_TTL_MS;
+        ne->expire_tick = now + lifetime;
+        ne->ambiguous = FALSE;
         strncpy_s(ne->domain, sizeof(ne->domain), domain, _TRUNCATE);
         ne->next           = g_dns_cache[bucket];
         g_dns_cache[bucket] = ne;
@@ -56,7 +68,7 @@ BOOL dns_cache_lookup(UINT32 ip, char *out_domain, size_t out_size)
     DNS_CACHE_ENTRY *e = g_dns_cache[bucket];
     while (e)
     {
-        if (e->ip == ip && e->expire_tick > now)
+        if (e->ip == ip && e->expire_tick > now && !e->ambiguous)
         {
             strncpy_s(out_domain, out_size, e->domain, _TRUNCATE);
             found = TRUE;
@@ -79,7 +91,14 @@ UINT32 dns_bucket_v6(const UINT8 ip6[16])
 
 void dns_cache_store_v6(const UINT8 ip6[16], const char *domain)
 {
-    if (!domain || domain[0] == '\0') return;
+    dns_cache_store_v6_ttl(ip6, domain, DNS_CACHE_TTL_MS / 1000);
+}
+
+void dns_cache_store_v6_ttl(const UINT8 ip6[16], const char *domain, UINT32 ttl)
+{
+    if (!domain || !pb_valid_hostname(domain)) return;
+    ULONGLONG lifetime = (ULONGLONG)ttl * 1000;
+    if (lifetime > DNS_CACHE_TTL_MS) lifetime = DNS_CACHE_TTL_MS;
     UINT32 bucket = dns_bucket_v6(ip6);
     ULONGLONG now = GetTickCount64();
 
@@ -89,8 +108,12 @@ void dns_cache_store_v6(const UINT8 ip6[16], const char *domain)
     {
         if (memcmp(e->ip6, ip6, 16) == 0)
         {
+            if (e->expire_tick <= now) e->ambiguous = FALSE;
+            else if (_stricmp(e->domain, domain)) e->ambiguous = TRUE;
+            ULONGLONG expiry = now + lifetime;
+            if (e->ambiguous && expiry < e->expire_tick) expiry = e->expire_tick;
             strncpy_s(e->domain, sizeof(e->domain), domain, _TRUNCATE);
-            e->expire_tick = now + DNS_CACHE_TTL_MS;
+            e->expire_tick = expiry;
             ReleaseSRWLockExclusive(&g_dns_cache_lock);
             return;
         }
@@ -100,7 +123,8 @@ void dns_cache_store_v6(const UINT8 ip6[16], const char *domain)
     if (ne)
     {
         memcpy(ne->ip6, ip6, 16);
-        ne->expire_tick = now + DNS_CACHE_TTL_MS;
+        ne->expire_tick = now + lifetime;
+        ne->ambiguous = FALSE;
         strncpy_s(ne->domain, sizeof(ne->domain), domain, _TRUNCATE);
         ne->next = g_dns_cache_v6[bucket];
         g_dns_cache_v6[bucket] = ne;
@@ -118,7 +142,7 @@ BOOL dns_cache_lookup_v6(const UINT8 ip6[16], char *out_domain, size_t out_size)
     DNS_CACHE_ENTRY_V6 *e = g_dns_cache_v6[bucket];
     while (e)
     {
-        if (memcmp(e->ip6, ip6, 16) == 0 && e->expire_tick > now)
+        if (memcmp(e->ip6, ip6, 16) == 0 && e->expire_tick > now && !e->ambiguous)
         {
             strncpy_s(out_domain, out_size, e->domain, _TRUNCATE);
             found = TRUE;
@@ -159,10 +183,12 @@ BOOL dns_parse_name(const UINT8 *msg, int msg_len, int *offset, char *dst, int d
             if (++jumps > 10) return FALSE;
             continue;
         }
+        if (b & 0xC0) return FALSE;
         int label_len = (int)b;
         pos++;
         if (pos + label_len > msg_len)       return FALSE;
         if (out + label_len + 2 >= dst_len)  return FALSE;
+        if (memchr(msg + pos, 0, label_len)) return FALSE;
         if (out > 0) dst[out++] = '.';
         memcpy(&dst[out], &msg[pos], label_len);
         out  += label_len;
@@ -171,61 +197,9 @@ BOOL dns_parse_name(const UINT8 *msg, int msg_len, int *offset, char *dst, int d
     return FALSE;
 }
 
-// Snoop an inbound DNS response (UDP payload starting at the DNS header).
-// For every A-record answer, store ip → qname in the DNS cache.
-void snoop_dns_response(const UINT8 *payload, int payload_len)
-{
-    if (payload_len < 12) return;
-
-    UINT16 flags   = ((UINT16)payload[2] << 8) | payload[3];
-    if (!(flags & 0x8000)) return;   // not a response
-    if  (flags & 0x000F)   return;   // RCODE != NOERROR
-
-    UINT16 qdcount = ((UINT16)payload[4] << 8) | payload[5];
-    UINT16 ancount = ((UINT16)payload[6] << 8) | payload[7];
-    if (ancount == 0) return;
-
-    int offset = 12;
-
-    // Extract the first question's name as the canonical hostname for this answer.
-    char qname[256];
-    if (!dns_parse_name(payload, payload_len, &offset, qname, sizeof(qname))) return;
-    offset += 4;  // QTYPE + QCLASS
-
-    // Skip any remaining questions
-    for (int q = 1; q < qdcount && offset < payload_len; q++)
-    {
-        char tmp[256];
-        if (!dns_parse_name(payload, payload_len, &offset, tmp, sizeof(tmp))) return;
-        offset += 4;
-    }
-
-    // Parse answer RRs
-    for (int i = 0; i < ancount && offset < payload_len; i++)
-    {
-        char rname[256];
-        if (!dns_parse_name(payload, payload_len, &offset, rname, sizeof(rname))) return;
-        if (offset + 10 > payload_len) return;
-
-        UINT16 rtype  = ((UINT16)payload[offset + 0] << 8) | payload[offset + 1];
-        UINT16 rclass = ((UINT16)payload[offset + 2] << 8) | payload[offset + 3];
-        UINT16 rdlen  = ((UINT16)payload[offset + 8] << 8) | payload[offset + 9];
-        offset += 10;
-        if (offset + rdlen > payload_len) return;
-
-        if (rtype == 1 /* A */ && rclass == 1 /* IN */ && rdlen == 4)
-        {
-            UINT32 ip;
-            memcpy(&ip, &payload[offset], 4);  // network-byte-order, matches ip_header->DstAddr
-            dns_cache_store(ip, qname);
-        }
-        else if (rtype == 28 /* AAAA */ && rclass == 1 /* IN */ && rdlen == 16)
-        {
-            dns_cache_store_v6(&payload[offset], qname);
-        }
-        offset += rdlen;
-    }
-}
+// Learning is restricted to DNS payloads on proxy-matched application flows.
+// In particular, no system-wide inbound port-53 capture is installed.
+#include "pb_dns_track.c"
 
 // Prune expired DNS-snoop entries (IPv4 + IPv6) so the caches don't grow without bound.
 void cleanup_stale_dns_cache(void)

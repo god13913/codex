@@ -50,7 +50,7 @@ const state = {
   screen: 'loading', reverse: false, busy: false, profiles: [], selectedId: null,
   mode: 'clash', draft: freshDraft('clash'), search: '', showSecret: false,
   exitIp: { value: null, visible: false, loading: false, error: '', checkedAt: null },
-  settings: { desktopPath: '', desktopSource: '', autoLocate: true, enabled: false, cliPathMismatch: false,
+  settings: { installationMode: 'service', desktopPath: '', desktopSource: '', enabled: false, cliPathMismatch: false,
     activeProfileId: null, theme: 'system', accent: 'auto', layoutPosition: 'editor', railRatio: 24, dockRatio: 48, nodeHeight: 200, sourceCollapsed: false, railCollapsed: false },
   draggingLayout: false, layoutPointerId: null,
 };
@@ -209,9 +209,9 @@ function renderGate() {
       <md-icon-button data-action="theme-cycle" title="切换浅色、深色或跟随系统" aria-label="切换主题">${ico('contrast')}</md-icon-button></div>
     <p class="eyebrow" style="margin-top:30px">桌面文件 · 首次设置</p>
     <h1>桌面版路径</h1>
-    <p class="supporting">选择 ChatGPT 桌面程序，继续配置 CLI 专属代理。</p>
+    <p class="supporting">选择 ChatGPT 桌面程序，继续配置专属代理。</p>
     <div class="gate-fields"><div class="gate-path"><md-outlined-text-field data-field="desktopPath" label="路径" value="${esc(state.settings.desktopPath)}" supporting-text="文件名须为 ChatGPT.exe。"></md-outlined-text-field></div>
-      <label class="switch-line">自动定位 <md-switch data-setting="autoLocate" ${state.settings.autoLocate ? 'selected' : ''} aria-label="自动定位"></md-switch></label></div>
+      <md-outlined-button data-action="locate-desktop">${ico('search', 'icon')}自动定位</md-outlined-button></div>
     <div class="gate-actions"><md-outlined-button data-action="choose-desktop">${ico('folder_open', 'icon')}选择桌面文件</md-outlined-button>
       <md-filled-button data-action="enter-main">${ico('arrow_forward', 'icon')}进入主界面</md-filled-button></div>
     <input id="desktop-picker" type="file" accept=".exe" hidden />
@@ -247,7 +247,7 @@ function renderClashEditor() {
     <div class="source-box-head"><div><p class="eyebrow">统一配置区</p><h3>订阅与节点</h3></div>
       <span class="source-box-badge">${state.draft.nodes?.length || 0} 个节点</span></div>
     <div class="form-grid"><div class="wide">${textField('name', '配置名称')}</div>
-      <div class="wide field-with-action">${textField('url', 'HTTPS Clash 订阅链接', { type: state.showSecret ? 'text' : 'password', support: '订阅地址保存在本地用户目录。' })}
+      <div class="wide field-with-action">${textField('url', 'HTTPS Clash 订阅链接', { type: state.showSecret ? 'text' : 'password', support: '订阅链接只保存在你的电脑上，不会上传。' })}
         <md-text-button class="field-action" data-action="show-secret">${ico(state.showSecret ? 'visibility_off' : 'visibility', 'icon')}${state.showSecret ? '隐藏' : '显示'}</md-text-button></div></div>
     <div class="inline-actions"><md-filled-tonal-button data-action="fetch-nodes">${ico('sync', 'icon')}获取 / 刷新节点</md-filled-tonal-button>
       <md-outlined-button data-action="import-file">${ico('upload_file', 'icon')}导入 Clash 文件</md-outlined-button>
@@ -289,7 +289,7 @@ function resizeHandle(kind, label) {
 }
 function renderExitIp() {
   const { value, visible, loading, error, checkedAt } = state.exitIp;
-  const label = state.mode === 'clash' ? '所选订阅节点出口 IPv4' : '当前节点出口 IPv4';
+  const label = state.mode === 'clash' ? '所选订阅节点出口 IP' : '当前节点出口 IP';
   const address = !visible ? hiddenIp : loading ? '正在检测…' : error ? '检测失败' : value || '尚未检测';
   const detail = visible && error ? error : visible && checkedAt
     ? `${new Date(checkedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 更新`
@@ -299,9 +299,9 @@ function renderExitIp() {
     <div class="exit-ip-copy"><span class="exit-ip-label">${label}</span>
       <strong class="exit-ip-value" aria-live="polite">${esc(address)}</strong>
       <small class="exit-ip-detail ${error && visible ? 'is-error' : ''}">${esc(detail)}</small></div>
-    <div class="exit-ip-actions"><button type="button" class="exit-ip-toggle" data-action="toggle-exit-ip" aria-label="${visible ? '隐藏' : '显示'}出口 IPv4" aria-pressed="${visible}">
+    <div class="exit-ip-actions"><button type="button" class="exit-ip-toggle" data-action="toggle-exit-ip" aria-label="${visible ? '隐藏' : '显示'}出口 IP" aria-pressed="${visible}">
       ${ico(visible ? 'visibility_off' : 'visibility')}<span>${visible ? '隐藏' : '显示'}</span></button>
-      ${visible ? `<button type="button" class="exit-ip-refresh" data-action="refresh-exit-ip" aria-label="刷新出口 IPv4" title="刷新出口 IPv4" ${loading ? 'disabled' : ''}>${ico('refresh')}</button>` : ''}</div>
+      ${visible ? `<button type="button" class="exit-ip-refresh" data-action="refresh-exit-ip" aria-label="刷新出口 IP" title="刷新出口 IP" ${loading ? 'disabled' : ''}>${ico('refresh')}</button>` : ''}</div>
   </section>`;
 }
 function renderMain() {
@@ -324,7 +324,7 @@ function renderMain() {
     <div class="layout-canvas ${isClash ? `layout-${layoutPosition}` : 'layout-single'}" data-layout-canvas>
       ${panelOutside ? renderClashEditor() : ''}
       <section class="config-card"><div class="card-head"><div><p class="eyebrow">配置工作区 / ${state.mode === 'clash' ? 'Clash' : 'VPS'}</p>
-        <h2>${state.mode === 'clash' ? '订阅与节点' : '手动配置节点'}</h2><p class="supporting">${state.mode === 'clash' ? '导入、筛选并保存一个出口节点。' : '输入你的服务器参数，保存为一个独立配置。'}</p></div>
+        <h2>${state.mode === 'clash' ? '订阅与节点' : '手动配置节点'}</h2><p class="supporting">${state.mode === 'clash' ? '导入节点，选一个作为出口并保存。' : '输入你的服务器参数，保存为一个独立配置。'}</p></div>
         <span class="status-chip ${state.settings.enabled ? 'active' : ''}">${ico(state.settings.enabled ? 'check_circle' : 'pause_circle')} ${state.settings.enabled ? '程序配置已启用' : state.settings.cliPathMismatch ? 'CLI 路径指向其他版本' : '程序配置未启用'}</span></div>
         <div class="card-body ${state.settings.railCollapsed ? 'rail-collapsed' : ''}">${renderProfileRail()}${resizeHandle('rail', state.settings.railCollapsed ? '向右拖动展开配置列表' : '向左拖动隐藏配置列表')}<div class="editor"><div class="editor-top"><div><h3>${current}</h3><p class="supporting">${state.mode === 'clash' ? 'Clash 订阅' : 'VPS / 节点'} · ${state.selectedId ? '修改后保存' : '填写后保存'}</p></div>
           <div class="editor-actions"><md-text-button data-action="export-profile">${ico('download', 'icon')}导出</md-text-button>
@@ -332,8 +332,12 @@ function renderMain() {
           ${editorContent}</div></div></section>
       ${panelOutside ? resizeHandle('dock', '拖动调整停靠面板大小') : ''}${isClash ? renderLayoutDropZones() : ''}
     </div>
+    <div class="installation-options"><md-outlined-select id="installation-mode" label="代理启动方式" menu-positioning="fixed">
+      ${option('service', '1. 安装 Windows 后台服务（推荐）', state.settings.installationMode === 'service')}
+      ${option('desktop', '2. 不安装服务，由桌面启动转发', state.settings.installationMode === 'desktop')}
+      </md-outlined-select><p class="supporting">服务模式在桌面启动前就准备好；不安装服务时，每次启动需要允许管理员授权。保存前请先完全退出桌面。</p></div>
     <div class="bottom-actions"><md-filled-button data-action="save-profile">${ico('add', 'icon')}保存并配置</md-filled-button>
-      <md-filled-button data-action="disable-proxy">${ico('power_settings_new', 'icon')}停用代理并恢复官方版CLI</md-filled-button></div>
+      <md-filled-button data-action="disable-proxy">${ico('power_settings_new', 'icon')}停用代理并恢复官方版</md-filled-button></div>
   </div></main>`;
 }
 function dialogMarkup() {
@@ -349,6 +353,7 @@ function dialogMarkup() {
       <p class="supporting">设备未提供可读取的强调色时，自动使用指定的 Purple 浅色和深色方案。</p>
       </section><section class="settings-section"><h3>桌面文件</h3><p class="settings-path">${esc(state.settings.desktopPath || '尚未选择')}</p><md-outlined-button data-action="edit-desktop">${ico('folder_open', 'icon')}更改桌面文件</md-outlined-button></section>
       <section class="settings-section"><h3>布局</h3><p class="supporting">拖动分区边缘把手调整大小，比例自动保存。</p><md-outlined-button data-action="reset-layout">${ico('restart_alt', 'icon')}恢复默认布局</md-outlined-button></section>
+      <section class="settings-section danger"><h3>卸载</h3><p class="supporting">停止并移除 Windows 后台服务，删除本程序安装的运行时和本地代理配置。官方桌面和配置器本身不会删除。</p><md-outlined-button data-action="uninstall-proxy">${ico('delete_forever', 'icon')}卸载专属代理</md-outlined-button></section>
     </div><div slot="actions" class="settings-actions"><md-text-button data-action="show-licenses">许可证显示</md-text-button><md-text-button id="settings-close">完成</md-text-button></div></md-dialog>
     <md-dialog id="license-dialog"><div slot="headline">许可证</div><div slot="content" class="license-content"></div>
       <div slot="actions"><md-text-button data-action="close-licenses">返回设置</md-text-button></div></md-dialog>`;
@@ -386,7 +391,7 @@ async function checkExitIp() {
   try {
     const bridge = window.codexProxy;
     const query = bridge?.getNodeExitIpv4;
-    if (typeof query !== 'function') throw new Error('节点检测仅在桌面程序中可用');
+    if (typeof query !== 'function') throw new Error('节点检测只能在桌面程序里使用。');
     const result = await Promise.race([
       query.call(bridge, profile),
       new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('查询超时，请重试')), 60000); }),
@@ -395,12 +400,12 @@ async function checkExitIp() {
     const ip = String(typeof result === 'string' ? result : result?.ip || '').trim();
     const parts = typeof ip === 'string' ? ip.split('.') : [];
     if (parts.length !== 4 || parts.some(part => !/^\d{1,3}$/.test(part) || Number(part) > 255)) {
-      throw new Error('查询结果不是有效的 IPv4 地址');
+      throw new Error('查询结果不是有效的 IP 地址');
     }
     state.exitIp.value = ip;
     state.exitIp.checkedAt = Date.now();
   } catch (error) {
-    if (requestId === exitIpRequest) state.exitIp.error = error instanceof Error ? error.message : '无法获取节点出口 IPv4';
+    if (requestId === exitIpRequest) state.exitIp.error = error instanceof Error ? error.message : '无法获取节点出口 IP';
   } finally {
     clearTimeout(timeout);
     if (requestId === exitIpRequest) {
@@ -581,7 +586,7 @@ async function saveProfile() {
     name: state.draft.name.trim(), createdAt: old?.createdAt || now, updatedAt: now };
   await withOperation('正在保存并配置…', async () => {
     const result = window.codexProxy?.native
-      ? await window.codexProxy.request('applyProfile', { profile, desktopPath: state.settings.desktopPath }) : null;
+      ? await window.codexProxy.request('applyProfile', { profile, desktopPath: state.settings.desktopPath, installationMode: state.settings.installationMode }) : null;
     const index = state.profiles.findIndex(p => p.id === profile.id);
     if (index < 0) state.profiles.unshift(profile); else state.profiles[index] = profile;
     state.profiles.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -634,7 +639,7 @@ async function exportSelected() {
 async function enterMain() {
   syncFormState();
   const path = state.settings.desktopPath.trim();
-  if (!/(^|[\\/])ChatGPT\.exe$/i.test(path)) throw new Error('请选择 ChatGPT.exe，或填写以 ChatGPT.exe 结尾的路径。');
+  if (!/(^|[\\/])ChatGPT\.exe$/i.test(path)) throw new Error('请选择 ChatGPT.exe，或点击“自动定位”后再进入主界面。');
   if (window.codexProxy?.native) await window.codexProxy.request('verifyDesktop', path);
   state.settings.desktopPath = path;
   await persistSettings();
@@ -643,7 +648,7 @@ async function enterMain() {
 
 function eventControl(event) {
   const path = event.composedPath?.() || [];
-  return path.find(node => node && (node.dataset?.field || node.dataset?.setting || node.id === 'profile-search' || node.id === 'desktop-picker' || node.id === 'clash-picker' || node.id === 'theme-choice' || node.id === 'accent-choice')) || event.target;
+  return path.find(node => node && (node.dataset?.field || node.id === 'profile-search' || node.id === 'desktop-picker' || node.id === 'clash-picker' || node.id === 'theme-choice' || node.id === 'accent-choice')) || event.target;
 }
 
 root.addEventListener('click', async event => {
@@ -681,6 +686,16 @@ root.addEventListener('click', async event => {
         if (path) { state.settings.desktopPath = path; state.settings.desktopSource = 'picker'; render(); }
       } else document.querySelector('#desktop-picker').click();
     }
+    else if (action === 'locate-desktop') await withOperation('正在查找官方桌面…', async () => {
+      if (!window.codexProxy?.native) throw new Error('自动定位仅在桌面配置器中可用，请选择 ChatGPT.exe。');
+      const path = await window.codexProxy.request('locateDesktop');
+      if (!path) throw new Error('没有找到官方桌面，请安装后重试或选择 ChatGPT.exe。');
+      state.settings.desktopPath = path;
+      state.settings.desktopSource = 'auto';
+      await persistSettings();
+      render();
+      toast('已找到官方桌面。');
+    });
     else if (action === 'enter-main') await enterMain();
     else if (action === 'new-profile') { resetExitIp(); state.selectedId = null; state.draft = freshDraft(state.mode); state.showSecret = false; render(); }
     else if (action === 'select-profile') selectProfile(target.dataset.id);
@@ -703,6 +718,21 @@ root.addEventListener('click', async event => {
     else if (action === 'disable-proxy') showConfirm('停用代理并恢复官方版 CLI？', '确认停用当前代理配置？', async () => {
       if (window.codexProxy?.native) await window.codexProxy.request('disableProxy');
       state.settings.enabled = false; state.settings.cliPathMismatch = false; state.settings.activeProfileId = null; await persistSettings(); render(); toast('代理配置已停用。');
+    });
+    else if (action === 'uninstall-proxy') showConfirm('卸载专属代理？', '这将停止并移除 Windows 服务，删除专属运行时和本地代理配置。官方桌面和配置器本身不会删除。', async () => {
+      await withOperation('正在卸载专属代理…', async () => {
+        if (!window.codexProxy?.native) throw new Error('卸载仅在桌面配置器中可用。');
+        await window.codexProxy.request('uninstallProxy');
+        state.profiles = [];
+        state.selectedId = null;
+        state.mode = 'clash';
+        state.draft = freshDraft('clash');
+        state.settings = { installationMode: 'service', desktopPath: '', desktopSource: '', enabled: false, cliPathMismatch: false,
+          activeProfileId: null, theme: 'system', accent: 'auto', layoutPosition: 'editor', railRatio: 24, dockRatio: 48, nodeHeight: 200, sourceCollapsed: false, railCollapsed: false };
+        document.querySelector('#settings-dialog')?.close();
+        render();
+        toast('专属代理已完全卸载。');
+      });
     });
   } catch (error) { fail(error); }
 });
@@ -787,14 +817,14 @@ root.addEventListener('change', async event => {
       const file = element.files?.[0]; if (!file) return;
       if (file.size > 4 * 1024 * 1024) throw new Error('配置文件超过 4 MB。');
       setImportedNodes(parseNodes(await file.text()), 'file');
+    } else if (element.id === 'installation-mode') {
+      state.settings.installationMode = element.value; await persistSettings();
     } else if (element.id === 'theme-choice') {
       state.settings.theme = element.value; await persistSettings(); applyColors(); render(); document.querySelector('#settings-dialog').show();
     } else if (element.id === 'accent-choice') {
       state.settings.accent = element.value; await persistSettings(); applyColors(); render(); document.querySelector('#settings-dialog').show();
     } else if (element.id === 'profile-search') {
       state.search = element.value || '';
-    } else if (element.dataset?.setting === 'autoLocate') {
-      state.settings.autoLocate = element.selected; await persistSettings();
     } else if (element.dataset?.field === 'protocol') {
       state.draft.protocol = element.value; render();
     } else if (element.tagName === 'MD-RADIO' && element.name === 'node') {

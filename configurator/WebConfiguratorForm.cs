@@ -9,6 +9,10 @@ internal sealed class WebConfiguratorForm : Form
 {
     private const string UiUrl = "https://codexproxy.local/index.html";
     private readonly WebView2 browser = new() { Dock = DockStyle.Fill };
+    private readonly Panel operationPanel = new() { Dock = DockStyle.Bottom, Height = 52, Visible = false,
+        BackColor = Color.FromArgb(232, 237, 247), Padding = new Padding(16, 8, 16, 8) };
+    private readonly Label operationLabel = new() { AutoSize = true, Text = "正在处理…", Anchor = AnchorStyles.Left };
+    private readonly ProgressBar operationProgress = new() { Dock = DockStyle.Fill, Style = ProgressBarStyle.Marquee, MarqueeAnimationSpeed = 24 };
     private readonly ConfiguratorBridge bridge;
     private bool showingFallback;
 
@@ -20,7 +24,14 @@ internal sealed class WebConfiguratorForm : Form
         ClientSize = new Size(1160, 820);
         MinimumSize = new Size(840, 620);
         AutoScaleMode = AutoScaleMode.Dpi;
+        var operationLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1 };
+        operationLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 270));
+        operationLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        operationLayout.Controls.Add(operationLabel, 0, 0);
+        operationLayout.Controls.Add(operationProgress, 1, 0);
+        operationPanel.Controls.Add(operationLayout);
         Controls.Add(browser);
+        Controls.Add(operationPanel);
         bridge = new ConfiguratorBridge(this);
         Shown += async (_, _) => await InitializeAsync();
     }
@@ -86,15 +97,26 @@ internal sealed class WebConfiguratorForm : Form
     private async void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs args)
     {
         int id = 0;
+        var showDisableProgress = false;
         try
         {
             var message = args.WebMessageAsJson;
-            if (message.Length > 8 * 1024 * 1024) throw new InvalidOperationException("请求数据过大。");
+            if (message.Length > 8 * 1024 * 1024) throw new InvalidOperationException("内容太大了，请精简后再试。");
             using var document = JsonDocument.Parse(message);
             var root = document.RootElement;
             id = root.GetProperty("id").GetInt32();
             var method = root.GetProperty("method").GetString() ?? "";
             var payload = root.TryGetProperty("payload", out var value) ? value.Clone() : default;
+            showDisableProgress = method is "disableProxy" or "uninstallProxy";
+            if (showDisableProgress)
+            {
+                SetOperationProgress(true, method == "uninstallProxy"
+                    ? "正在卸载专属代理、服务和运行时…"
+                    : "正在停用专属代理并移除 Windows 服务…");
+                // Give the native progress bar a paint opportunity before the
+                // hidden elevated helper is started and awaited.
+                await Task.Yield();
+            }
             var result = await bridge.DispatchAsync(method, payload);
             browser.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(new { id, result }));
         }
@@ -103,5 +125,17 @@ internal sealed class WebConfiguratorForm : Form
             var message = error is InvalidOperationException ? error.Message : "操作失败，请检查网络或本机配置。";
             browser.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(new { id, error = message }));
         }
+        finally
+        {
+            if (showDisableProgress) SetOperationProgress(false, "");
+        }
+    }
+
+    private void SetOperationProgress(bool visible, string text)
+    {
+        if (IsDisposed) return;
+        operationLabel.Text = text;
+        operationPanel.Visible = visible;
+        if (visible) operationPanel.BringToFront();
     }
 }

@@ -1,4 +1,6 @@
 #include "pb_internal.h"
+#include "pb_hostname.c"
+#include "pb_udp.c"
 
 // Relay: TCP/UDP relay servers and per-connection worker threads.
 
@@ -595,6 +597,9 @@ DWORD WINAPI connection_handler(LPVOID arg)
 
     free(config);
 
+    // Keep the first connection local until the service kernel authenticates.
+    if (!pb_wait_upstream()) { closesocket(client_sock); return 1; }
+
     // Look up the proxy config for this connection
     PROXY_CONFIG *proxy = find_proxy_config(proxy_config_id);
     if (proxy == NULL || proxy->host[0] == '\0' || proxy->port == 0)
@@ -642,13 +647,16 @@ DWORD WINAPI connection_handler(LPVOID arg)
         return 0;
     }
 
+    char observed_domain[256];
+    BOOL observed = proxy->send_domain_to_proxy && pb_peek_hostname(client_sock, dest_port, observed_domain);
     if (proxy->type == PROXY_TYPE_SOCKS5)
     {
         int rc;
         char cached_domain[256];
         // Per-config: only hand the hostname to the proxy (socks5h) when this config
         // opts in; otherwise send the locally-resolved IP (socks5).
-        if (is_ipv6)
+        if (observed) rc = socks5_connect_domain(socks_sock, observed_domain, dest_port, proxy);
+        else if (is_ipv6)
         {
             if (proxy->send_domain_to_proxy && dns_cache_lookup_v6(dest_ip6, cached_domain, sizeof(cached_domain)))
                 rc = socks5_connect_domain(socks_sock, cached_domain, dest_port, proxy);
@@ -671,8 +679,13 @@ DWORD WINAPI connection_handler(LPVOID arg)
     }
     else if (proxy->type == PROXY_TYPE_HTTP)
     {
-        int rc = is_ipv6
-            ? http_connect_v6(socks_sock, dest_ip6, dest_port, proxy)
+        char cached_domain[256];
+        BOOL cached = !observed && proxy->send_domain_to_proxy && (is_ipv6
+            ? dns_cache_lookup_v6(dest_ip6, cached_domain, sizeof(cached_domain))
+            : dns_cache_lookup(dest_ip, cached_domain, sizeof(cached_domain)));
+        int rc = observed ? http_connect_domain(socks_sock, observed_domain, dest_port, proxy)
+            : cached ? http_connect_domain(socks_sock, cached_domain, dest_port, proxy)
+            : is_ipv6 ? http_connect_v6(socks_sock, dest_ip6, dest_port, proxy)
             : http_connect(socks_sock, dest_ip, dest_port, proxy);
         if (rc != 0)
         {
@@ -710,6 +723,7 @@ DWORD WINAPI connection_handler(LPVOID arg)
 
     transfer_config->from_socket = client_sock;
     transfer_config->to_socket = socks_sock;
+    transfer_config->dns = dest_port == 53 ? pb_dns_tracker_new() : NULL;
 
     // both transfer in current thread
     transfer_handler((LPVOID)transfer_config);
@@ -721,11 +735,33 @@ DWORD WINAPI connection_handler(LPVOID arg)
 
 // One-directional relay: reads from `from` and writes to `to`.
 // Runs as a dedicated thread so upload and download never block each other.
-// Uses a shared RELAY_PAIR reference count for safe socket cleanup:
-//   - whichever direction finishes first calls shutdown() on both sockets,
-//     which causes the sibling thread's recv() to return 0 and exit cleanly.
-//   - the last thread to exit (refs drops to 0) closes both sockets and
-//     frees the shared RELAY_PAIR.
+// Nonblocking sockets let both directions notice Stop, including a send stalled
+// by backpressure. A normal EOF half-closes only the opposite send direction.
+static BOOL relay_wait(RELAY_PAIR *pair, SOCKET s, BOOL writing)
+{
+    while (running && !InterlockedCompareExchange(&pair->aborted, 0, 0)) {
+        fd_set ready;
+        FD_ZERO(&ready); FD_SET(s, &ready);
+        struct timeval wait = {0, 200000};
+        int rc = select(0, writing ? NULL : &ready, writing ? &ready : NULL, NULL, &wait);
+        if (rc > 0) return running && !InterlockedCompareExchange(&pair->aborted, 0, 0);
+        if (rc == SOCKET_ERROR && WSAGetLastError() != WSAEINTR) return FALSE;
+    }
+    return FALSE;
+}
+
+static BOOL relay_send(RELAY_PAIR *pair, SOCKET s, const char *buf, int length)
+{
+    int sent = 0;
+    while (sent < length && relay_wait(pair, s, TRUE)) {
+        int n = send(s, buf + sent, length - sent, 0);
+        if (n > 0) sent += n;
+        else if (n == 0 || (WSAGetLastError() != WSAEWOULDBLOCK && WSAGetLastError() != WSAEINTR))
+            return FALSE;
+    }
+    return sent == length;
+}
+
 DWORD WINAPI one_way_relay(LPVOID arg)
 {
     ONE_WAY_CONFIG *cfg = (ONE_WAY_CONFIG *)arg;
@@ -735,28 +771,37 @@ DWORD WINAPI one_way_relay(LPVOID arg)
     free(cfg);
 
     char *buf = (char *)malloc(131072);  // 128 KB per-direction buffer
+    BOOL clean_eof = FALSE;
     if (buf)
     {
-        int len;
-        while ((len = recv(from, buf, 131072, 0)) > 0)
-        {
-            if (send_all(to, buf, len) == SOCKET_ERROR)
+        while (relay_wait(pair, from, FALSE)) {
+            int len = recv(from, buf, 131072, 0);
+            if (len == 0) { clean_eof = TRUE; break; }
+            if (len == SOCKET_ERROR) {
+                if (WSAGetLastError() == WSAEWOULDBLOCK || WSAGetLastError() == WSAEINTR) continue;
                 break;
+            }
+            pb_dns_stream(pair->dns, from == pair->sock_proxy, (const BYTE *)buf, len);
+            if (!relay_send(pair, to, buf, len)) break;
         }
         free(buf);
     }
 
-    // Signal the sibling relay to stop by shutting down both sockets.
-    // shutdown() is safe to call from any thread; it just drains/resets the
-    // socket without closing the handle, so the other thread's recv() returns 0.
-    shutdown(pair->sock_client, SD_BOTH);
-    shutdown(pair->sock_proxy,  SD_BOTH);
+    if (clean_eof && running) {
+        shutdown(to, SD_SEND);
+    } else {
+        // Errors, allocation failure and cancellation abort the sibling as well.
+        InterlockedExchange(&pair->aborted, 1);
+        shutdown(pair->sock_client, SD_BOTH);
+        shutdown(pair->sock_proxy, SD_BOTH);
+    }
 
     // Last thread out closes and frees everything.
     if (InterlockedDecrement(&pair->refs) == 0)
     {
         closesocket(pair->sock_client);
         closesocket(pair->sock_proxy);
+        pb_dns_tracker_free(pair->dns);
         free(pair);
     }
 
@@ -772,6 +817,7 @@ DWORD WINAPI transfer_handler(LPVOID arg)
     TRANSFER_CONFIG *config = (TRANSFER_CONFIG *)arg;
     SOCKET sock_client = config->from_socket;
     SOCKET sock_proxy  = config->to_socket;
+    PB_DNS_TRACKER *dns = config->dns;
     free(config);
 
     RELAY_PAIR *pair = (RELAY_PAIR *)malloc(sizeof(RELAY_PAIR));
@@ -779,11 +825,21 @@ DWORD WINAPI transfer_handler(LPVOID arg)
     {
         closesocket(sock_client);
         closesocket(sock_proxy);
+        pb_dns_tracker_free(dns);
         return 1;
     }
     pair->sock_client = sock_client;
     pair->sock_proxy  = sock_proxy;
     pair->refs        = 2;
+    pair->aborted     = 0;
+    pair->dns         = dns;
+
+    u_long nonblocking = 1;
+    if (ioctlsocket(sock_client, FIONBIO, &nonblocking) ||
+        ioctlsocket(sock_proxy, FIONBIO, &nonblocking)) {
+        closesocket(sock_client); closesocket(sock_proxy); pb_dns_tracker_free(dns); free(pair);
+        return 1;
+    }
 
     // Upload: client → proxy  (dedicated thread - may block on slow proxy send)
     ONE_WAY_CONFIG *up = (ONE_WAY_CONFIG *)malloc(sizeof(ONE_WAY_CONFIG));
@@ -794,6 +850,7 @@ DWORD WINAPI transfer_handler(LPVOID arg)
     {
         free(up);
         free(dn);
+        pb_dns_tracker_free(dns);
         free(pair);
         closesocket(sock_client);
         closesocket(sock_proxy);
@@ -809,6 +866,7 @@ DWORD WINAPI transfer_handler(LPVOID arg)
     {
         free(up);
         free(dn);
+        pb_dns_tracker_free(dns);
         free(pair);
         closesocket(sock_client);
         closesocket(sock_proxy);

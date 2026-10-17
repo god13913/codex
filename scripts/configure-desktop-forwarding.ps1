@@ -10,6 +10,7 @@ if ((Get-AuthenticodeSignature -LiteralPath $desktop).Status -ne 'Valid') {
 }
 $configuration = @{
     schema=1
+    desktop_package_family='OpenAI.Codex_2p2nqsd0c76g0'
     desktop_executable=$desktop
     desktop_sha256=(Get-FileHash -LiteralPath $desktop -Algorithm SHA256).Hash
     bridge_sha256=(Get-FileHash -LiteralPath (Join-Path $root 'ProxyBridge.dll') -Algorithm SHA256).Hash

@@ -9,5 +9,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../configurator/PrivateStore.cs" Link="PrivateStore.cs" />
+    <Compile Include="../../configurator/ManagedRuntime.cs" Link="ManagedRuntime.cs" />
   </ItemGroup>
 </Project>

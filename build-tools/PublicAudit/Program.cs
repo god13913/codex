@@ -18,6 +18,7 @@ foreach (var name in new[] { "subscription.json", "subscription-cache.json", "vp
 markers.Add(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
 var patterns = markers.SelectMany(value => new[] { Encoding.UTF8.GetBytes(value), Encoding.Unicode.GetBytes(value) }).ToArray();
 var inspected = 0;
+var runtimeComponents = 0;
 var maxPattern = patterns.Length == 0 ? 1 : patterns.Max(value => value.Length);
 Console.WriteLine($"Loaded {markers.Count} private fingerprints without printing their values.");
 
@@ -25,7 +26,18 @@ using (var manifest = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(assets, 
 using (var archive = ZipFile.OpenRead(Path.Combine(assets, "runtime.zip")))
 {
     var files = manifest.RootElement.GetProperty("files").EnumerateObject().ToDictionary(p => p.Name, p => p.Value.GetString()!);
-    if (archive.Entries.Count != 10 || files.Count != 10) throw new InvalidDataException("Runtime file count mismatch");
+    var requiredFiles = new[] { "codex.exe", "codex-code-mode-host.exe", "codex-windows-sandbox-setup.exe",
+        "codex-windows-sandbox-service.exe", "codex-command-runner.exe", "codex-mihomo.exe",
+        "codex-proxy-service.exe", "ProxyBridge.dll", "WinDivert.dll", "WinDivert64.sys",
+        "codex-dedicated-proxy.distribution" }.ToHashSet(StringComparer.Ordinal);
+    runtimeComponents = requiredFiles.Count;
+    if (archive.Entries.Count != requiredFiles.Count || !requiredFiles.SetEquals(files.Keys) ||
+        !requiredFiles.SetEquals(archive.Entries.Select(entry => entry.FullName)))
+        throw new InvalidDataException("Runtime component set mismatch");
+    var bundleMaterial = string.Join("\n", files.OrderBy(p => p.Key, StringComparer.Ordinal).Select(p => p.Key + ":" + p.Value));
+    var bundleId = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(bundleMaterial))).ToLowerInvariant()[..16];
+    if (manifest.RootElement.GetProperty("bundle_id").GetString() != bundleId)
+        throw new InvalidDataException("Runtime bundle id mismatch");
     foreach (var entry in archive.Entries)
     {
         if (!files.TryGetValue(entry.FullName, out var expected) || Path.GetFileName(entry.FullName) != entry.FullName)
@@ -119,7 +131,7 @@ if (args.Length > 1)
     var only = Directory.GetFiles(Path.GetDirectoryName(executable)!, "*", SearchOption.AllDirectories);
     if (only.Length != 1 || only[0] != executable) throw new InvalidDataException("Publish directory contains loose files");
     var result = new { state = "verified", executable_bytes = input.Length, sha256 = HashFile(executable), bundle_components = count,
-        runtime_components = 10, private_fingerprint_matches = 0, tests_run = false };
+        runtime_components = runtimeComponents, private_fingerprint_matches = 0, tests_run = false };
     File.WriteAllText(Path.Combine(workspace, "runtime", "public-final-audit.json"), JsonSerializer.Serialize(result));
     Console.WriteLine(JsonSerializer.Serialize(result));
 }

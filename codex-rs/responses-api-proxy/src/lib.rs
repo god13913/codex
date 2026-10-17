@@ -71,6 +71,20 @@ struct ForwardConfig {
 
 /// Entry point for the library main, for parity with other crates.
 pub fn run_main(args: Args) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(|home| PathBuf::from(home).join(".codex"))
+        })
+        .context("cannot locate Codex home")?;
+    let _dedicated_proxy = runtime
+        .block_on(codex_dedicated_proxy::start_service_if_enabled(&home))
+        .context("dedicated proxy could not start; upstream requests were not sent directly")?;
     let auth_header = read_auth_header_from_stdin()?;
 
     let upstream_url = Url::parse(&args.upstream_url).context("parsing --upstream-url")?;
@@ -99,8 +113,15 @@ pub fn run_main(args: Args) -> Result<()> {
     }
     let server = Server::from_listener(listener, None)
         .map_err(|err| anyhow!("creating HTTP server: {err}"))?;
+    let mut client_builder = Client::builder();
+    if let Some(endpoint) = codex_dedicated_proxy::active_proxy_url() {
+        let proxy = reqwest::Proxy::all(endpoint)
+            .context("invalid dedicated upstream proxy")?
+            .no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1"));
+        client_builder = client_builder.no_proxy().proxy(proxy);
+    }
     let client = Arc::new(
-        Client::builder()
+        client_builder
             // Disable reqwest's 30s default so long-lived response streams keep flowing.
             .timeout(None::<Duration>)
             .build()

@@ -1122,9 +1122,10 @@ async fn cli_main(
             | Some(Subcommand::Logout(_))
             | Some(Subcommand::Resume(_))
             | Some(Subcommand::Fork(_))
+            | Some(Subcommand::Cloud(_))
     ) || matches!(&subcommand, Some(Subcommand::AppServer(server)) if server.subcommand.is_none());
     let _proxy_runtime = if needs_dedicated_proxy {
-        match codex_dedicated_proxy::start_if_enabled(&find_codex_home()?).await {
+        match codex_dedicated_proxy::start_service_if_enabled(&find_codex_home()?).await {
             Ok(runtime) => runtime,
             Err(error) => {
                 return Err(error.context(
